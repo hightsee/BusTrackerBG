@@ -31,8 +31,8 @@ A Telegram bot for checking live bus arrivals in Belgrade using the Beograd Plus
 
 1. Clone the repo:
 ```bash
-git clone https://github.com/yourusername/belgrade-bus-bot
-cd belgrade-bus-bot
+git clone https://github.com/hightsee/BusTrackerBG
+cd BusTrackerBG
 ```
 
 2. Install dependencies:
