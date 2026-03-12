@@ -57,7 +57,7 @@ python bus_bot.py
 
 ## Environment Variables
 
-See `.env.example` for all required variables. Never commit your `.env` file.
+See `.env.example` for all required variables.
 
 ## How It Works
 
