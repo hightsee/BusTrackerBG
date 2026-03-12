@@ -27,6 +27,14 @@ A Telegram bot for checking live bus arrivals in Belgrade using the Beograd Plus
 - Python 3.8+
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
+### Bot Access
+You can add the bot to your telegram through the link t.me/BusTrackerBG_bot
+
+If you want to run it yourself follow the installation below
+
+|
+v
+
 ### Installation
 
 1. Clone the repo:
