@@ -4,7 +4,7 @@ import base64
 import time
 import os
 import urllib.parse
-from typing import List, Optional, Dict, Any, Set
+from typing import List, Optional, Dict, Any, Set, cast
 import requests
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
@@ -22,7 +22,9 @@ BASE_URL = "https://announcement-bgnaplata.ticketing.rs"
 AES_KEY_B64 = "3+Lhz8XaOli6bHIoYPGuq9Y8SZxEjX6eN7AFPZuLCLs="
 AES_IV_B64 = "IvUScqUudyxBTBU9ZCyjow=="
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 FAVORITES_FILE = "favorites.json"
+USERS_FILE = "users.json"
 
 def load_favorites() -> Dict[str, Dict[str, Any]]:
     """Loads favorites from the JSON file."""
@@ -43,6 +45,25 @@ def save_favorites(favorites_data: Dict[str, Dict[str, Any]]):
             json.dump(favorites_data, f, indent=4, ensure_ascii=False)
     except Exception as e:
         logging.error(f"Error saving favorites: {e}")
+
+def load_users() -> Dict[str, Dict[str, Any]]:
+    """Loads users from the JSON file."""
+    try:
+        if not os.path.exists(USERS_FILE):
+            return {}
+        with open(USERS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Error loading users: {e}")
+        return {}
+
+def save_users(users_data: Dict[str, Dict[str, Any]]):
+    """Saves users to the JSON file."""
+    try:
+        with open(USERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(users_data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Error saving users: {e}")
 
 def get_aes_cipher():
     key = base64.b64decode(AES_KEY_B64)
@@ -203,9 +224,9 @@ def get_arrivals(station_uid: str, target_lines: Optional[List[str]] = None) -> 
         
         if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
             if data["data"][0].get("success") is False:
-                return f"No buses are currently scheduled or tracking available for station {station_uid}."
+                return f"Trenutno nema zakazanih autobusa ili dostupnog praćenja za stanicu {station_uid}."
             
-            station_name = str(data["data"][0].get("station_name", f"Station {station_uid}"))
+            station_name = str(data["data"][0].get("station_name", f"Stanica {station_uid}"))
             
             # Use a list of dicts to store arrival info for sorting
             arrivals_data: List[Dict[str, Any]] = []
@@ -238,28 +259,28 @@ def get_arrivals(station_uid: str, target_lines: Optional[List[str]] = None) -> 
             
             lines_info: List[str] = []
             for arr in arrivals_data:
-                lines_info.append(f"Line {arr['line']:4} - Arriving in {arr['eta_mins']:2} min ({arr['eta_secs']} sec)")
+                lines_info.append(f"Linija {arr['line']:4} - Stiže za {arr['eta_mins']:2} min ({arr['eta_secs']} sek)")
             
             if use_filter:
                 missing_lines = actual_targets.difference(found_lines)
                 for line in sorted(list(missing_lines)):
-                    lines_info.append(f"Line {line:4} - didn't start it's journey yet.")
+                    lines_info.append(f"Linija {line:4} - još nije krenula.")
             
             if not lines_info:
-                return f"No matching lines found at {station_name}."
+                return f"Nema rezultata za tražene linije na stanici {station_name}."
                 
-            return f"<b>Arrivals for: {station_name}</b>\n\n" + "\n".join(lines_info)
+            return f"<b>Dolasci za: {station_name}</b>\n\n" + "\n".join(lines_info)
         else:
-            return "No live tracking data available right now."
+            return "Trenutno nema dostupnih podataka o praćenju uživo."
     except requests.exceptions.RequestException as e:
         logging.error(f"Network error in get_arrivals: {e}")
-        return "Network error. Please try again later."
+        return "Mrežna greška. Molimo pokušajte ponovo kasnije."
     except json.JSONDecodeError as e:
         logging.error(f"JSON error in get_arrivals: {e}")
-        return "Error parsing server response."
+        return "Greška pri obradi odgovora servera."
     except Exception as e:
         logging.error(f"Unexpected error in get_arrivals: {e}")
-        return f"An unexpected error occurred: {str(e)}"
+        return f"Došlo je do neočekivane greške: {str(e)}"
 
 # --- Telegram Bot Handlers ---
 
@@ -270,31 +291,81 @@ logging.basicConfig(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        if update.effective_user:
+            user_id = str(update.effective_user.id)
+            username = update.effective_user.username or "N/A"
+            current_date = time.strftime("%Y-%m-%d %H:%M:%S")
+
+            users = load_users()
+            if user_id not in users:
+                users[user_id] = {
+                    "username": username,
+                    "first_started": current_date
+                }
+                save_users(users)
+                logging.info(f"New user registered: {user_id} ({username})")
+
         welcome_text = (
-            "Welcome to the Bus Bot! 🚌\n\n"
-            "I can help you track live bus arrivals in Belgrade.\n\n"
-            "Type /help to see all available commands and how to use them."
+            "Dobrodošli u Bus Bot! 🚌\n\n"
+            "Mogu vam pomoći da pratite dolaske autobusa uživo u Beogradu.\n\n"
+            "Ukucajte /help da vidite sve dostupne komande i kako da ih koristite."
         )
         if update.message:
             await update.message.reply_text(welcome_text)
     except Exception as e:
         logging.error(f"Error in start handler: {e}")
 
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message or not update.effective_user:
+            return
+
+        if update.effective_user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Niste ovlašćeni za korišćenje ove komande.")
+            return
+
+        users = load_users()
+        total_users = len(users)
+        
+        user_list = []
+        for uid, info in users.items():
+            username = info.get("username", "N/A")
+            since = info.get("first_started", "Nepoznato")
+            user_list.append(f"• ID: <code>{uid}</code> | @{username} | Prvi put pokrenut: {since}")
+
+        report = (
+            f"📊 <b>Ukupno korisnika: {total_users}</b>\n\n" +
+            "\n".join(user_list)
+        )
+        
+        # Split message if it's too long (Telegram limit is 4096)
+        report_str: str = str(report)
+        if len(report_str) > 4000:
+            for i in range(0, len(report_str), 4000):
+                end_idx = min(i + 4000, len(report_str))
+                chunk = cast(Any, report_str)[i:end_idx]
+                await update.message.reply_text(chunk, parse_mode='HTML')
+        else:
+            await update.message.reply_text(report_str, parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Error in users_command handler: {e}")
+        await update.message.reply_text("Došlo je do greške prilikom preuzimanja liste korisnika.")
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message:
             return
         help_text = (
-            "<b>Available Commands:</b>\n\n"
-            "<b>Station Information</b>\n"
-            "• /stations - List sample available stations\n"
-            "• /search [name] - Search for a station by its name\n"
-            "• /check [id/name/fav] [lines] - Get live arrivals (e.g. /check 182, /check home 16, /check 'Skola Josif Pancic')\n\n"
-            "<b>Favorites</b>\n"
-            "• /save [name] [id/station_name] - Save a station to your favorites\n"
-            "• /favorites - List all your saved favorites\n"
-            "• /delete [name] - Remove a favorite\n\n"
-            "<i>If you need help with commands, type /help at any time.</i>"
+            "<b>Dostupne komande:</b>\n\n"
+            "<b>Informacije o stanicama</b>\n"
+            "• /stations - Prikaži primer dostupnih stanica\n"
+            "• /search [naziv] - Pretraži stanicu po nazivu\n"
+            "• /check [id/naziv/favorit] [linije] - Proveri dolaske (npr. /check 182, /check kuca 16, /check 'Skola Josif Pancic')\n\n"
+            "<b>Omiljene Stanice</b>\n"
+            "• /save [naziv] [id/naziv_stanice] - Sačuvaj stanicu u Omiljene Stanice\n"
+            "• /favorites - Izlistaj sve sačuvane Omiljene Stanice\n"
+            "• /delete [naziv] - Obriši Omiljenu Stanicu\n\n"
+            "<i>Ako vam je potrebna pomoć sa komandama, ukucajte /help u bilo kom trenutku.</i>"
         )
         await update.message.reply_text(help_text, parse_mode='HTML')
     except Exception as e:
@@ -304,11 +375,11 @@ async def stations(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message:
             return
-        await update.message.reply_text("Fetching station list... ⏳")
+        await update.message.reply_text("Preuzimanje liste stanica... ⏳")
         all_stations = fetch_stations_list()
         
         if not all_stations:
-            await update.message.reply_text("Failed to fetch stations. Please try again later.")
+            await update.message.reply_text("Neuspešno preuzimanje stanica. Molimo pokušajte ponovo kasnije.")
             return
 
         # Filter/Sample some stations for display
@@ -317,43 +388,43 @@ async def stations(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stations_to_sample = all_stations
         for i in range(min(len(stations_to_sample), sample_size)):
             s = stations_to_sample[i]
-            name = str(s.get("name", "Unknown"))
+            name = str(s.get("name", "Nepoznato"))
             station_id = str(s.get("station_id", "N/A"))
             stations_info.append(f"• <b>{name}</b> (ID: {station_id})")
         
         stations_text = (
-            "<b>Available Stations (Sample):</b>\n\n" +
+            "<b>Dostupne stanice (primer):</b>\n\n" +
             "\n".join(stations_info) +
-            f"\n\nListing {sample_size} out of {len(all_stations)} stations.\n"
-            "Use /check [ID] [Lines] to get arrivals.\n\n"
-            "<i>Type /help for more info.</i>"
+            f"\n\nPrikazano {sample_size} od {len(all_stations)} stanica.\n"
+            "Koristite /check [ID] [Linije] za dolaske.\n\n"
+            "<i>Ukucajte /help za više informacija.</i>"
         )
         await update.message.reply_text(stations_text, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Error in stations handler: {e}")
         if update.message:
-            await update.message.reply_text("An error occurred while fetching stations.")
+            await update.message.reply_text("Došlo je do greške prilikom preuzimanja stanica.")
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message:
             return
         if not context.args:
-            await update.message.reply_text("Usage: /search [station name]\nExample: /search Skola Josif Pancic")
+            await update.message.reply_text("Upotreba: /search [naziv stanice]\nPrimer: /search Skola Josif Pancic")
             return
         
         query = " ".join(context.args)
-        await update.message.reply_text(f"Searching for '{query}'... ⏳")
+        await update.message.reply_text(f"Pretražujem '{query}'... ⏳")
         
         all_stations = fetch_stations_list()
         if not all_stations:
-            await update.message.reply_text("Failed to fetch stations. Please try again later.")
+            await update.message.reply_text("Neuspešno preuzimanje stanica. Molimo pokušajte ponovo kasnije.")
             return
             
         matches = search_stations(query, all_stations)
         
         if not matches:
-            await update.message.reply_text(f"No stations found matching '{query}'.")
+            await update.message.reply_text(f"Nisu pronađene stanice koje odgovaraju '{query}'.")
             return
             
         results_info: List[str] = []
@@ -362,40 +433,40 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         matches_to_show = matches
         for i in range(min(len(matches_to_show), max_results)):
             s = matches_to_show[i]
-            name = str(s.get("name", "Unknown"))
+            name = str(s.get("name", "Nepoznato"))
             station_id = str(s.get("station_id", "N/A"))
             results_info.append(f"• <b>{name}</b> (ID: <code>{station_id}</code>)")
             
         results_text = (
-            f"<b>Found {len(matches)} matching stations:</b>\n\n" +
+            f"<b>Pronađeno {len(matches)} stanica:</b>\n\n" +
             "\n".join(results_info)
         )
         
         if len(matches) > max_results:
-            results_text += f"\n\n...and {len(matches) - max_results} more. Try a more specific search if needed."
+            results_text += f"\n\n...i još {len(matches) - max_results}. Pokušajte sa specifičnijim nazivom ako je potrebno."
             
-        results_text += "\n\nUse /check [ID] to get arrivals.\n\n"
-        results_text += "<i>Type /help for more info.</i>"
+        results_text += "\n\nKoristite /check [ID] za dolaske.\n\n"
+        results_text += "<i>Ukucajte /help za više informacija.</i>"
         
         await update.message.reply_text(results_text, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Error in search handler: {e}")
         if update.message:
-            await update.message.reply_text("An error occurred during search.")
+            await update.message.reply_text("Došlo je do greške prilikom pretrage.")
 
 async def save_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message or not update.effective_user:
             return
         if not context.args or len(context.args) < 2:
-            await update.message.reply_text("Usage: /save [favorite_name] [station_id_or_name]\nExample: /save home 465")
+            await update.message.reply_text("Upotreba: /save [naziv_favorita] [id_ili_naziv_stanice]\nPrimer: /save kuca 465")
             return
         
         fav_name = context.args[0]
         identifier = " ".join(context.args[1:])
         user_id = str(update.effective_user.id)
         
-        await update.message.reply_text(f"Resolving '{identifier}' for favorite '{fav_name}'... ⏳")
+        await update.message.reply_text(f"Pretražujem '{identifier}' za favorit '{fav_name}'... ⏳")
         
         res = await resolve_station_identifier(user_id, identifier)
         
@@ -411,7 +482,7 @@ async def save_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 results_info.append(f"• <b>{s.get('name')}</b> (ID: <code>{s.get('station_id')}</code>)")
             
             error_text = (
-                f"Multiple stations found for '{identifier}'. Please use the specific ID to save:\n\n" +
+                f"Pronađeno je više stanica za '{identifier}'. Molimo koristite tačan ID za čuvanje:\n\n" +
                 "\n".join(results_info)
             )
             await update.message.reply_text(error_text, parse_mode='HTML')
@@ -430,14 +501,14 @@ async def save_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_favorites(favorites)
         
         await update.message.reply_text(
-            f"✅ Saved <b>{fav_name}</b> -> {res['name']} (ID: {res['id_display']})\n\n"
-            "<i>Type /help for more info.</i>",
+            f"✅ Sačuvano: <b>{fav_name}</b> -> {res['name']} (ID: {res['id_display']})\n\n"
+            "<i>Ukucajte /help za više informacija.</i>",
             parse_mode='HTML'
         )
     except Exception as e:
         logging.error(f"Error in save handler: {e}")
         if update.message:
-            await update.message.reply_text("An error occurred while saving favorite.")
+            await update.message.reply_text("Došlo je do greške prilikom čuvanja favorita.")
 
 async def list_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -449,7 +520,7 @@ async def list_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_favs = favorites.get(user_id, {})
         
         if not user_favs:
-            await update.message.reply_text("You haven't saved any favorites yet. Use /save to add some!")
+            await update.message.reply_text("Još uvek niste sačuvali nijedan favorit. Koristite /save da ih dodate!")
             return
             
         favs_list: List[str] = []
@@ -464,21 +535,21 @@ async def list_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sid = find_station_id_by_uid(fav_data, all_stations) or "N/A"
             favs_list.append(f"• <b>{name}</b> (ID: <code>{sid}</code>)")
             
-        results_text = "<b>Your Favorites:</b>\n\n" + "\n".join(favs_list)
-        results_text += "\n\nUse /check [favorite_name] to see arrivals.\n\n"
-        results_text += "<i>Type /help for more info.</i>"
+        results_text = "<b>Vaše Omiljene Stanice:</b>\n\n" + "\n".join(favs_list)
+        results_text += "\n\nKoristite /check [naziv_omiljene_stanice] da vidite dolaske.\n\n"
+        results_text += "<i>Ukucajte /help za više informacija.</i>"
         await update.message.reply_text(results_text, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Error in favorites handler: {e}")
         if update.message:
-            await update.message.reply_text("An error occurred while listing favorites.")
+            await update.message.reply_text("Došlo je do greške prilikom izlistavanja favorita.")
 
 async def delete_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message or not update.effective_user:
             return
         if not context.args:
-            await update.message.reply_text("Usage: /delete [favorite_name]")
+            await update.message.reply_text("Upotreba: /delete [naziv_favorita]")
             return
             
         fav_name = context.args[0]
@@ -489,16 +560,16 @@ async def delete_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE):
             favorites[user_id].pop(fav_name, None)
             save_favorites(favorites)
             await update.message.reply_text(
-                f"✅ Deleted favorite '{fav_name}'.\n\n"
-                "<i>Type /help for more info.</i>",
+                f"✅ Obrisan favorit '{fav_name}'.\n\n"
+                "<i>Ukucajte /help za više informacija.</i>",
                 parse_mode='HTML'
             )
         else:
-            await update.message.reply_text(f"Could not find favorite '{fav_name}'.")
+            await update.message.reply_text(f"Favorit '{fav_name}' nije pronađen.")
     except Exception as e:
         logging.error(f"Error in delete handler: {e}")
         if update.message:
-            await update.message.reply_text("An error occurred while deleting favorite.")
+            await update.message.reply_text("Došlo je do greške prilikom brisanja favorita.")
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -506,38 +577,42 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         if not context.args:
-            await update.message.reply_text("Usage: /check [station_id_or_name] [optional_lines]\nExample: /check 182 58 74 or /check 'Zeleni venac'")
+            await update.message.reply_text("Upotreba: /check [id_ili_naziv_stanice] [opcione_linije]\nPrimer: /check 182 58 74 ili /check 'Zeleni venac'")
             return
         
-        # Smarter parsing: try to distinguish between station name/id and lines
-        # Rule of thumb: lines are usually numeric and come at the end
+        # New parsing logic: reading from the end backwards
         user_id = str(update.effective_user.id)
         args_list: List[str] = list(context.args or [])
-        station_id_or_name = " ".join(args_list) # Default to everything
-        target_lines = None
+        station_id_or_name = ""
+        target_lines: Optional[List[str]] = None
 
-        # Try to see if the full string works
+        if len(args_list) > 1:
+            # Check from the end for items that look like line numbers
+            # (must contain at least one digit and we stop before the very first argument)
+            split_idx = len(args_list)
+            for i in range(len(args_list) - 1, 0, -1):
+                arg = args_list[i]
+                if any(c.isdigit() for c in arg):
+                    split_idx = i
+                else:
+                    break
+            
+            station_id_or_name = " ".join(cast(Any, args_list)[0:split_idx])
+            # If nothing is left for the name, treat everything as the name (e.g. /check 16 17)
+            if not station_id_or_name:
+                station_id_or_name = " ".join(args_list)
+                target_lines = None
+            else:
+                target_lines = cast(Any, args_list)[split_idx:len(args_list)] if split_idx < len(args_list) else None
+        else:
+            station_id_or_name = args_list[0]
+            target_lines = None
+
+        if not station_id_or_name:
+             await update.message.reply_text("Molimo navedite naziv ili ID stanice.")
+             return
+
         res = await resolve_station_identifier(user_id, station_id_or_name)
-        
-        # If no match or error, try checking if the last args are actually lines
-        if ("error" in res or "matches" in res) and len(args_list) > 1:
-            for i in range(1, len(args_list) + 1):
-                # We try from 1 to all args as being potentially lines
-                # If we have something like /check Skola Josif Pancic 23
-                potential_name = " ".join([args_list[j] for j in range(len(args_list) - i)])
-                potential_lines = [args_list[j] for j in range(len(args_list) - i, len(args_list))]
-                
-                if not potential_name:
-                    break # Ran out of words for name
-
-                # Check if potential_lines actually look like lines (alphanumeric containing digits)
-                if all(any(c.isdigit() for c in l) for l in potential_lines):
-                    temp_res = await resolve_station_identifier(user_id, potential_name)
-                    if "uid" in temp_res:
-                        res = temp_res
-                        target_lines = potential_lines
-                        station_id_or_name = potential_name
-                        break
 
         if "error" in res:
             await update.message.reply_text(res["error"])
@@ -546,15 +621,22 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "matches" in res:
             matches = res["matches"]
             results_info: List[str] = []
-            for i in range(min(len(matches), 10)):
-                s = matches[i]
+            # List all matching stations with their IDs
+            for s in matches:
                 results_info.append(f"• <b>{s.get('name')}</b> (ID: <code>{s.get('station_id')}</code>)")
             
             error_text = (
-                f"Multiple stations found for '{station_id_or_name}'. Please use the specific ID:\n\n" +
+                f"Više stanica odgovara nazivu '{station_id_or_name}'. "
+                "Molimo koristite ID stanice direktno umesto naziva:\n\n" +
                 "\n".join(results_info) +
-                "\n\n<i>Type /help for more info.</i>"
+                "\n\n<i>Ukucajte /help za više informacija.</i>"
             )
+            
+            # Ensure message doesn't exceed Telegram length limit
+            if len(error_text) > 4000:
+                truncated_text = cast(Any, error_text)[0:3900]
+                error_text = truncated_text + "\n\n... (previše rezultata, pokušajte sa specifičnijim nazivom)"
+                
             await update.message.reply_text(error_text, parse_mode='HTML')
             return
 
@@ -562,7 +644,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_name = res["name"]
         sid_display = res["id_display"]
 
-        status_msg = f"Fetching live data for <b>{display_name}</b>"
+        status_msg = f"Preuzimam podatke uživo za <b>{display_name}</b>"
         if sid_display != "FAV":
             status_msg += f" (ID: <code>{sid_display}</code>)"
         status_msg += "... ⏳"
@@ -572,13 +654,13 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Append help hint to arrivals result if successful
         if "⚠️" not in result:
-             result += "\n\n<i>Type /help for more info.</i>"
+             result += "\n\n<i>Ukucajte /help za više informacija.</i>"
              
         await update.message.reply_text(result, parse_mode='HTML')
     except Exception as e:
         logging.error(f"Error in check handler: {e}")
         if update.message:
-            await update.message.reply_text("An error occurred while fetching arrivals.")
+            await update.message.reply_text("Došlo je do greške prilikom preuzimanja dolazaka.")
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -591,6 +673,7 @@ if __name__ == '__main__':
     favs_handler = CommandHandler('favorites', list_favorites)
     delete_handler = CommandHandler('delete', delete_favorite)
     help_handler = CommandHandler('help', help_command)
+    users_handler = CommandHandler('users', users_command)
     
     application.add_handler(start_handler)
     application.add_handler(stations_handler)
@@ -600,6 +683,7 @@ if __name__ == '__main__':
     application.add_handler(favs_handler)
     application.add_handler(delete_handler)
     application.add_handler(help_handler)
+    application.add_handler(users_handler)
     
     print("Bot is running...")
     application.run_polling()
