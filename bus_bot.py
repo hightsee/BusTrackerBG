@@ -14,6 +14,7 @@ import zipfile
 import io
 import csv
 import threading
+import tempfile
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
@@ -329,12 +330,20 @@ class GTFSManager:
         conn.close()
 
     def update_gtfs(self):
-        logging.info("Starting GTFS update...")
+        logging.info("Starting GTFS update (memory efficient mode)...")
+        temp_zip = None
         try:
-            response = requests.get(GTFS_URL, timeout=120)
-            response.raise_for_status()
+            # Download in chunks to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip", mode='wb') as tmp_file:
+                tmp = cast(Any, tmp_file)
+                temp_zip = tmp.name
+                with requests.get(GTFS_URL, stream=True, timeout=120) as r:
+                    r.raise_for_status()
+                    for chunk in r.iter_content(chunk_size=8192):
+                        tmp.write(chunk)
             
-            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+            # Parse from the temporary file directly
+            with zipfile.ZipFile(temp_zip) as z:
                 self._parse_zip(z)
                 
             conn = sqlite3.connect(self.db_path)
@@ -345,17 +354,27 @@ class GTFSManager:
             logging.info("GTFS update completed successfully.")
         except Exception as e:
             logging.error(f"Error updating GTFS: {e}")
+        finally:
+            if temp_zip and os.path.exists(temp_zip):
+                try:
+                    os.remove(temp_zip)
+                except Exception as e:
+                    logging.error(f"Failed to remove temp GTFS zip: {e}")
 
     def _parse_zip(self, z: zipfile.ZipFile):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        def load_csv(filename: str) -> Any:
+        def iter_csv(filename: str):
             if filename not in z.namelist():
-                return []
+                return
             with z.open(filename) as f:
-                content = f.read().decode('utf-8-sig')
-                return list(csv.DictReader(io.StringIO(content)))
+                # Wrap binary stream in TextIOWrapper to read line by line
+                # Use utf-8-sig to handle optional BOM
+                text_wrapper = io.TextIOWrapper(f, encoding='utf-8-sig')
+                reader = csv.DictReader(text_wrapper)
+                for row in reader:
+                    yield row
 
         cursor.execute("DELETE FROM routes")
         cursor.execute("DELETE FROM trips")
@@ -363,31 +382,32 @@ class GTFSManager:
         cursor.execute("DELETE FROM calendar")
 
         logging.info("Parsing routes.txt...")
-        for row in load_csv('routes.txt'):
+        for row in iter_csv('routes.txt'):
             r = cast(Dict[str, Any], row)
             cursor.execute("INSERT INTO routes (route_id, route_short_name, route_long_name) VALUES (?, ?, ?)",
                            (r.get('route_id'), r.get('route_short_name'), r.get('route_long_name', '')))
 
         logging.info("Parsing trips.txt...")
-        for row in load_csv('trips.txt'):
+        for row in iter_csv('trips.txt'):
             r = cast(Dict[str, Any], row)
             cursor.execute("INSERT INTO trips (trip_id, route_id, service_id, trip_headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
                            (r.get('trip_id'), r.get('route_id'), r.get('service_id'), r.get('trip_headsign', ''), r.get('direction_id')))
 
         logging.info("Parsing stop_times.txt...")
-        # Direct insert for efficiency
         st_data = []
-        for row in load_csv('stop_times.txt'):
+        for row in iter_csv('stop_times.txt'):
             r = cast(Dict[str, Any], row)
             st_data.append((r.get('trip_id'), r.get('arrival_time'), r.get('departure_time'), r.get('stop_id'), int(r.get('stop_sequence', 0))))
-            if len(st_data) > 10000:
+            if len(st_data) >= 10000:
                 cursor.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", st_data)
+                conn.commit() # Commit periodically to keep Journal size small
                 st_data = []
         if st_data:
             cursor.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", st_data)
+            conn.commit()
 
         logging.info("Parsing calendar.txt...")
-        for row in load_csv('calendar.txt'):
+        for row in iter_csv('calendar.txt'):
             r = cast(Dict[str, Any], row)
             cursor.execute("INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                            (r.get('service_id'), int(r.get('monday', 0)), int(r.get('tuesday', 0)), int(r.get('wednesday', 0)), int(r.get('thursday', 0)), int(r.get('friday', 0)), int(r.get('saturday', 0)), int(r.get('sunday', 0)), r.get('start_date'), r.get('end_date')))
@@ -884,6 +904,12 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         line_no = context.args[0].replace(",", "")
         await update.message.reply_text(f"Preuzimam red vožnje za liniju {line_no}... ⏳")
+        
+        # Check if database is ready
+        if not gtfs_manager.get_last_update():
+            await update.message.reply_text("Podaci o redu vožnje se još uvek preuzimaju, molimo pokušajte ponovo za nekoliko minuta.")
+            return
+            
         result = gtfs_manager.get_timetable(line_no)
         await update.message.reply_text(result, parse_mode='HTML')
     except Exception as e:
