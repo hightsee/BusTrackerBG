@@ -4,7 +4,8 @@ A Telegram bot for checking live bus arrivals in Belgrade using the Beograd Plus
 
 ## Features
 
-- **Live bus arrivals** — real-time data from the Beograd Plus API
+- **Live bus arrivals** — real-time data with improved grouping by bus line
+- **Planned timetables** — offline schedules from Belgrade GTFS data (data.gov.rs)
 - **Station search** — search by name with or without Serbian special characters (č, ć, š, ž, đ)
 - **Favorite stops** — save your most used stations per user
 - **Per-user data** — every user's favorites are completely separate
@@ -16,10 +17,18 @@ A Telegram bot for checking live bus arrivals in Belgrade using the Beograd Plus
 |---|---|
 | `/start` | Welcome message and usage guide |
 | `/search [name]` | Search for a station by name, e.g. `/search Zeleni venac` |
-| `/check [station_id or name] [lines]` | Live arrivals for a station filtered by line, e.g. `/check 465 58 74` |
+| `/check [station_id or name] [lines]` | Live arrivals for a station, e.g. `/check 465 58 74` |
+| `/timetable [line]` | Planned schedule for a specific line, e.g. `/timetable 58` |
 | `/save [name] [station_id]` | Save a favorite stop, e.g. `/save home 465` |
 | `/favorites` | List all your saved favorite stops |
 | `/delete [name]` | Remove a favorite stop |
+
+### Admin Commands
+| Command | Description |
+|---|---|
+| `/users` | List all registered users and their start dates |
+| `/timetablestatus` | Check GTFS database health and last update time |
+| `/refreshtimetable` | Manually trigger a GTFS data refresh from data.gov.rs |
 
 ## Setup
 

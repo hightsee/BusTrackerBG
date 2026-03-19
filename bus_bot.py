@@ -9,6 +9,13 @@ import requests
 from dotenv import load_dotenv
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
+import sqlite3
+import zipfile
+import io
+import csv
+import threading
+from datetime import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
 
@@ -25,6 +32,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 FAVORITES_FILE = "favorites.json"
 USERS_FILE = "users.json"
+GTFS_URL = "https://data.gov.rs/s/resources/gradski-javni-prevoz-u-beogradu-gtfs/20251031-111721/bgprev-belgrade-rs-2-.zip"
+GTFS_DB = "gtfs.db"
 
 def load_favorites() -> Dict[str, Dict[str, Any]]:
     """Loads favorites from the JSON file."""
@@ -223,53 +232,66 @@ def get_arrivals(station_uid: str, target_lines: Optional[List[str]] = None) -> 
         data = json.loads(decrypted_text)
         
         if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
-            if data["data"][0].get("success") is False:
-                return f"Trenutno nema zakazanih autobusa ili dostupnog praćenja za stanicu {station_uid}."
+            # Even if success is False, we might have station metadata
+            first_item = data["data"][0]
+            success = first_item.get("success") is not False
+            station_name = str(first_item.get("station_name", f"Stanica {station_uid}"))
             
-            station_name = str(data["data"][0].get("station_name", f"Stanica {station_uid}"))
-            
-            # Use a list of dicts to store arrival info for sorting
-            arrivals_data: List[Dict[str, Any]] = []
+            arrivals_by_line: Dict[str, List[Dict[str, Any]]] = {}
             found_lines: Set[str] = set()
             
-            # Explicitly narrow target_lines to avoid linter confusion
             actual_targets: Set[str] = set()
             use_filter = False
             if target_lines is not None:
-                actual_targets = set(target_lines)
+                actual_targets = {str(line).strip() for line in target_lines}
                 use_filter = True
             
-            for item in data["data"]:
-                line_no = str(item.get("line_number", "Unknown")).strip()
-                eta_seconds = item.get("seconds_left")
-                
-                if use_filter and line_no not in actual_targets:
-                    continue
-                
-                found_lines.add(line_no)
-                if eta_seconds is not None:
-                    arrivals_data.append({
-                        "line": line_no,
-                        "eta_mins": int(eta_seconds) // 60,
-                        "eta_secs": int(eta_seconds)
-                    })
+            if success:
+                for item in data["data"]:
+                    line_no = str(item.get("line_number", "Unknown")).strip()
+                    eta_seconds = item.get("seconds_left")
+                    
+                    if use_filter and line_no not in actual_targets:
+                        continue
+                        
+                    if eta_seconds is not None:
+                        found_lines.add(line_no)
+                        if line_no not in arrivals_by_line:
+                            arrivals_by_line[line_no] = []
+                        arrivals_by_line[line_no].append({
+                            "eta_mins": int(eta_seconds) // 60,
+                            "eta_secs": int(eta_seconds)
+                        })
+
+            # Build result string
+            output_parts = [f"<b>Dolasci za: {station_name}</b>\n"]
             
-            # Sort arrivals by seconds_left (ascending)
-            arrivals_data.sort(key=lambda x: x["eta_secs"])
+            # Sort active lines by their nearest arrival
+            sorted_lines = sorted(
+                arrivals_by_line.keys(),
+                key=lambda x: min(a["eta_secs"] for a in arrivals_by_line[x])
+            )
             
-            lines_info: List[str] = []
-            for arr in arrivals_data:
-                lines_info.append(f"Linija {arr['line']:4} - Stiže za {arr['eta_mins']:2} min ({arr['eta_secs']} sek)")
+            for line in sorted_lines:
+                output_parts.append(f"<b>Linija {line}</b>")
+                # Sort arrivals for this specific line
+                line_arrivals = sorted(arrivals_by_line[line], key=lambda x: x["eta_secs"])
+                for arr in line_arrivals:
+                    output_parts.append(f"• Stiže za {arr['eta_mins']} min ({arr['eta_secs']} sek)")
+                output_parts.append("") # Spacer
             
+            # Handle missing lines requested by user
             if use_filter:
                 missing_lines = actual_targets.difference(found_lines)
-                for line in sorted(list(missing_lines)):
-                    lines_info.append(f"Linija {line:4} - još nije krenula.")
+                if missing_lines:
+                    for line in sorted(list(missing_lines)):
+                        output_parts.append(f"Linija {line} - Jos uvek nije krenula")
             
-            if not lines_info:
-                return f"Nema rezultata za tražene linije na stanici {station_name}."
+            # If no data at all and no specific filter
+            if not sorted_lines and not (use_filter and actual_targets):
+                return f"Trenutno nema zakazanih autobusa ili dostupnog praćenja za stanicu {station_name}."
                 
-            return f"<b>Dolasci za: {station_name}</b>\n\n" + "\n".join(lines_info)
+            return "\n".join(output_parts).strip()
         else:
             return "Trenutno nema dostupnih podataka o praćenju uživo."
     except requests.exceptions.RequestException as e:
@@ -281,6 +303,194 @@ def get_arrivals(station_uid: str, target_lines: Optional[List[str]] = None) -> 
     except Exception as e:
         logging.error(f"Unexpected error in get_arrivals: {e}")
         return f"Došlo je do neočekivane greške: {str(e)}"
+
+# --- GTFS Timetable Logic ---
+
+class GTFSManager:
+    def __init__(self, db_path: str = GTFS_DB):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS routes (route_id TEXT PRIMARY KEY, route_short_name TEXT, route_long_name TEXT)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS trips (trip_id TEXT PRIMARY KEY, route_id TEXT, service_id TEXT, trip_headsign TEXT, direction_id INTEGER)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS stop_times (trip_id TEXT, arrival_time TEXT, departure_time TEXT, stop_id TEXT, stop_sequence INTEGER)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS calendar (service_id TEXT PRIMARY KEY, monday INTEGER, tuesday INTEGER, wednesday INTEGER, thursday INTEGER, friday INTEGER, saturday INTEGER, sunday INTEGER, start_date TEXT, end_date TEXT)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+        
+        # Indexes for performance
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trips_route_service ON trips (route_id, service_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_stoptimes_trip_seq ON stop_times (trip_id, stop_sequence)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_routes_short_name ON routes (route_short_name)")
+        
+        conn.commit()
+        conn.close()
+
+    def update_gtfs(self):
+        logging.info("Starting GTFS update...")
+        try:
+            response = requests.get(GTFS_URL, timeout=120)
+            response.raise_for_status()
+            
+            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                self._parse_zip(z)
+                
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", ("last_update", datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            logging.info("GTFS update completed successfully.")
+        except Exception as e:
+            logging.error(f"Error updating GTFS: {e}")
+
+    def _parse_zip(self, z: zipfile.ZipFile):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        def load_csv(filename: str) -> Any:
+            if filename not in z.namelist():
+                return []
+            with z.open(filename) as f:
+                content = f.read().decode('utf-8-sig')
+                return list(csv.DictReader(io.StringIO(content)))
+
+        cursor.execute("DELETE FROM routes")
+        cursor.execute("DELETE FROM trips")
+        cursor.execute("DELETE FROM stop_times")
+        cursor.execute("DELETE FROM calendar")
+
+        logging.info("Parsing routes.txt...")
+        for row in load_csv('routes.txt'):
+            r = cast(Dict[str, Any], row)
+            cursor.execute("INSERT INTO routes (route_id, route_short_name, route_long_name) VALUES (?, ?, ?)",
+                           (r.get('route_id'), r.get('route_short_name'), r.get('route_long_name', '')))
+
+        logging.info("Parsing trips.txt...")
+        for row in load_csv('trips.txt'):
+            r = cast(Dict[str, Any], row)
+            cursor.execute("INSERT INTO trips (trip_id, route_id, service_id, trip_headsign, direction_id) VALUES (?, ?, ?, ?, ?)",
+                           (r.get('trip_id'), r.get('route_id'), r.get('service_id'), r.get('trip_headsign', ''), r.get('direction_id')))
+
+        logging.info("Parsing stop_times.txt...")
+        # Direct insert for efficiency
+        st_data = []
+        for row in load_csv('stop_times.txt'):
+            r = cast(Dict[str, Any], row)
+            st_data.append((r.get('trip_id'), r.get('arrival_time'), r.get('departure_time'), r.get('stop_id'), int(r.get('stop_sequence', 0))))
+            if len(st_data) > 10000:
+                cursor.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", st_data)
+                st_data = []
+        if st_data:
+            cursor.executemany("INSERT INTO stop_times VALUES (?, ?, ?, ?, ?)", st_data)
+
+        logging.info("Parsing calendar.txt...")
+        for row in load_csv('calendar.txt'):
+            r = cast(Dict[str, Any], row)
+            cursor.execute("INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (r.get('service_id'), int(r.get('monday', 0)), int(r.get('tuesday', 0)), int(r.get('wednesday', 0)), int(r.get('thursday', 0)), int(r.get('friday', 0)), int(r.get('saturday', 0)), int(r.get('sunday', 0)), r.get('start_date'), r.get('end_date')))
+
+        conn.commit()
+        conn.close()
+
+    def get_last_update(self) -> Optional[str]:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'last_update'")
+            res = cursor.fetchone()
+            conn.close()
+            return res[0] if res else None
+        except Exception:
+            return None
+
+    def get_timetable(self, line_no: str) -> str:
+        now = datetime.now()
+        day_eng = now.strftime('%A').lower()
+        today_str = now.strftime('%Y%m%d')
+
+        # Serbian names for days and months
+        serbian_days = {
+            'monday': 'Ponedeljak', 'tuesday': 'Utorak', 'wednesday': 'Sreda',
+            'thursday': 'Četvrtak', 'friday': 'Petak', 'saturday': 'Subota', 'sunday': 'Nedelja'
+        }
+        serbian_months = [
+            '', 'Januar', 'Februar', 'Mart', 'April', 'Maj', 'Jun',
+            'Jul', 'Avgust', 'Septembar', 'Oktobar', 'Novembar', 'Decembar'
+        ]
+        
+        day_srb = serbian_days.get(day_eng, day_eng.capitalize())
+        date_srb = f"{now.day}. {serbian_months[now.month]} {now.year}."
+        header_date = f"📅 <b>{day_srb}, {date_srb}</b>"
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT route_id, route_long_name FROM routes WHERE route_short_name = ?", (line_no,))
+        route = cursor.fetchone()
+        if not route:
+            conn.close()
+            return f"Linija {line_no} nije pronađena u planiranom redu vožnje."
+        
+        route_id, route_long_name = route
+
+        # Strictly today's service IDs
+        query = f"SELECT service_id FROM calendar WHERE {day_eng} = 1 AND start_date <= ? AND end_date >= ?"
+        cursor.execute(query, (today_str, today_str))
+        service_ids = [r[0] for r in cursor.fetchall()]
+
+        if not service_ids:
+            conn.close()
+            return f"{header_date}\n\nNema aktivnih polazaka za liniju {line_no} za današnji dan."
+
+        placeholders = ', '.join(['?'] * len(service_ids))
+        query = f"""
+            SELECT t.trip_headsign, st.departure_time, t.direction_id
+            FROM trips t
+            JOIN stop_times st ON t.trip_id = st.trip_id
+            WHERE t.route_id = ? AND t.service_id IN ({placeholders}) AND st.stop_sequence = 1
+            ORDER BY t.direction_id, st.departure_time
+        """
+        cursor.execute(query, [route_id] + service_ids)
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            return f"{header_date}\n\nNema dostupnih planiranih polazaka za liniju {line_no} od početne stanice."
+
+        directions: Dict[str, List[str]] = {}
+        for row_headsign, dep_time, dir_id in rows:
+            headsign = str(row_headsign or f"Smer {dir_id}")
+            time_hm = ":".join(dep_time.split(":")[:2])
+            if headsign not in directions:
+                directions[headsign] = []
+            if time_hm not in directions[headsign]:
+                directions[headsign].append(time_hm)
+
+        result = [f"{header_date}\n<b>Planirani red vožnje: Linija {line_no}</b>\n<i>{route_long_name}</i>\n"]
+        for headsign, times in directions.items():
+            result.append(f"➡️ <b>Smer: {headsign}</b>")
+            result.append(", ".join(times) + "\n")
+
+        return "\n".join(result)
+
+# Initialize GTFS
+gtfs_manager = GTFSManager()
+scheduler = BackgroundScheduler()
+
+def scheduled_gtfs_update():
+    logging.info("Running scheduled GTFS update...")
+    gtfs_manager.update_gtfs()
+
+# Check if initial download is needed
+if not gtfs_manager.get_last_update():
+    logging.info("First run: Starting GTFS database build in background...")
+    threading.Thread(target=gtfs_manager.update_gtfs).start()
+
+scheduler.add_job(scheduled_gtfs_update, 'cron', day_of_week='mon', hour=4)
+scheduler.start()
 
 # --- Telegram Bot Handlers ---
 
@@ -357,10 +567,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         help_text = (
             "<b>Dostupne komande:</b>\n\n"
-            "<b>Informacije o stanicama</b>\n"
+            "<b>Informacije o stanicama i linijama</b>\n"
             "• /stations - Prikaži primer dostupnih stanica\n"
             "• /search [naziv] - Pretraži stanicu po nazivu\n"
-            "• /check [id/naziv/favorit] [linije] - Proveri dolaske (npr. /check 182, /check kuca 16, /check 'Skola Josif Pancic')\n\n"
+            "• /check [id/naziv/favorit] [linije] - Proveri dolaske (npr. /check 182, /check kuca 16)\n"
+            "• /timetable [linija] - Planirani red vožnje za liniju (npr. /timetable 58)\n\n"
             "<b>Omiljene Stanice</b>\n"
             "• /save [naziv] [id/naziv_stanice] - Sačuvaj stanicu u Omiljene Stanice\n"
             "• /favorites - Izlistaj sve sačuvane Omiljene Stanice\n"
@@ -536,7 +747,7 @@ async def list_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
             favs_list.append(f"• <b>{name}</b> (ID: <code>{sid}</code>)")
             
         results_text = "<b>Vaše Omiljene Stanice:</b>\n\n" + "\n".join(favs_list)
-        results_text += "\n\nKoristite /check [naziv_omiljene_stanice] da vidite dolaske.\n\n"
+        results_text += "\n\nKoristite /check [naziv_omiljene_stanice ] da vidite dolaske.\n\n"
         results_text += "<i>Ukucajte /help za više informacija.</i>"
         await update.message.reply_text(results_text, parse_mode='HTML')
     except Exception as e:
@@ -591,9 +802,10 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # (must contain at least one digit and we stop before the very first argument)
             split_idx = len(args_list)
             for i in range(len(args_list) - 1, 0, -1):
-                arg = args_list[i]
+                arg = args_list[i].replace(",", "")
                 if any(c.isdigit() for c in arg):
                     split_idx = i
+                    args_list[i] = arg
                 else:
                     break
             
@@ -662,6 +874,53 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message:
             await update.message.reply_text("Došlo je do greške prilikom preuzimanja dolazaka.")
 
+async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message:
+            return
+        if not context.args:
+            await update.message.reply_text("Upotreba: /timetable [broj_linije]\nPrimer: /timetable 58")
+            return
+        
+        line_no = context.args[0].replace(",", "")
+        await update.message.reply_text(f"Preuzimam red vožnje za liniju {line_no}... ⏳")
+        result = gtfs_manager.get_timetable(line_no)
+        await update.message.reply_text(result, parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Error in timetable handler: {e}")
+        if update.message:
+            await update.message.reply_text("Došlo je do greške prilikom preuzimanja reda vožnje.")
+
+async def refresh_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message or not update.effective_user:
+            return
+        if update.effective_user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Niste ovlašćeni za ovu komandu.")
+            return
+
+        await update.message.reply_text("Pokrećem osvežavanje GTFS baze podataka u pozadini... ⏳")
+        threading.Thread(target=gtfs_manager.update_gtfs).start()
+    except Exception as e:
+        logging.error(f"Error in refresh_timetable: {e}")
+
+async def timetable_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message or not update.effective_user:
+            return
+        if update.effective_user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Niste ovlašćeni za ovu komandu.")
+            return
+
+        last_update = gtfs_manager.get_last_update()
+        if last_update:
+            msg = f"✅ GTFS baza je poslednji put ažurirana: <code>{last_update}</code>"
+        else:
+            msg = "❌ GTFS baza još uvek nije inicijalizovana."
+        await update.message.reply_text(msg, parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Error in timetable_status: {e}")
+
 if __name__ == '__main__':
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
@@ -684,6 +943,11 @@ if __name__ == '__main__':
     application.add_handler(delete_handler)
     application.add_handler(help_handler)
     application.add_handler(users_handler)
+    
+    # GTFS Handlers
+    application.add_handler(CommandHandler('timetable', timetable))
+    application.add_handler(CommandHandler('refreshtimetable', refresh_timetable))
+    application.add_handler(CommandHandler('timetablestatus', timetable_status))
     
     print("Bot is running...")
     application.run_polling()
