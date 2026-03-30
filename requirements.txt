@@ -3,3 +3,7 @@ python-dotenv
 pycryptodome
 python-telegram-bot
 apscheduler
+Flask
+flask-cors
+PyJWT
+bcrypt

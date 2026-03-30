@@ -2,8 +2,10 @@
 __pycache__/
 *.pyc
 favorites.json
+users.json
 bus_test.py
 bus_bot_backup.py
 bgpp
 test.py
 gtfs.db
+bot_data.db
