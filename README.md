@@ -1,90 +1,71 @@
-# Belgrade Bus Bot
+# Belgrade Bus Bot 🚌
 
-A Telegram bot for checking live bus arrivals in Belgrade using the Beograd Plus public transport API. Supports real-time arrival times, station search with Serbian character normalization, and per-user favorite stops.
+> **⚠️ WARNING: LIVE API CURRENTLY UNAVAILABLE ⚠️**
+> The Beograd Plus live public transport API has recently changed and is currently unreachable. **Because of this, live arrivals (the `/check` command) are temporarily disabled.** 
+> 
+> As a fallback, the bot now runs entirely on offline GTFS data (official schedules). Please use the **`/nextat`** and **`/predict`** commands to view planned departures instead!
+
+A simple Telegram bot for checking bus schedules and tracking public transport in Belgrade.
 
 ## Features
 
-- **Live bus arrivals** — real-time data with improved grouping by bus line
-- **Planned timetables** — offline schedules from Belgrade GTFS data (data.gov.rs)
-- **Station search** — search by name with or without Serbian special characters (č, ć, š, ž, đ)
-- **Favorite stops** — save your most used stations per user
-- **Per-user data** — every user's favorites are completely separate
-- **Line filtering** — check only the specific bus lines you care about
+- **Offline Schedules** — Since the live API is down, the bot calculates the next departures using official GTFS timetable data.
+- **Station Search** — Search for station IDs by name (supports Serbian characters).
+- **Favorites** — Save your most-used stations so you don't have to remember their IDs.
+- **Line Filtering** — View schedules for specific bus lines only.
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `/start` | Welcome message and usage guide |
-| `/search [name]` | Search for a station by name, e.g. `/search Zeleni venac` |
-| `/check [station_id or name] [lines]` | Live arrivals for a station, e.g. `/check 465 58 74` |
-| `/timetable [line]` | Planned schedule for a specific line, e.g. `/timetable 58` |
-| `/save [name] [station_id]` | Save a favorite stop, e.g. `/save home 465` |
-| `/favorites` | List all your saved favorite stops |
-| `/delete [name]` | Remove a favorite stop |
+| Command | Status | Description |
+|---|---|---|
+| `/start` | 🟢 Active | Welcome message and instructions |
+| `/search [name]`| 🟢 Active | Search for a station by name (e.g., `/search Josif`) |
+| `/nextat [station] [line]`| 🟢 **Active Main** | Shows the next planned departures for a station |
+| `/timetable [line]`| 🟢 Active | Shows the full daily schedule for a specific line |
+| `/predict [line]`| 🟢 Active | Shows predicted bus positions based on the timetable |
+| `/route [line]`| 🟢 Active | Lists all the stops for a specific bus line |
+| `/save [name] [id]`| 🟢 Active | Saves a station to your favorites (e.g., `/save home 182`) |
+| `/favorites`| 🟢 Active | Lists all your saved favorite stations |
+| `/check` | 🔴 **Disabled** | *Normally shows live arrivals, but the API is currently down.* |
+| `/stations` | 🔴 **Disabled** | *Normally shows a live list of stations, currently disabled.* |
 
-### Admin Commands
-| Command | Description |
-|---|---|
-| `/users` | List all registered users and their start dates |
-| `/timetablestatus` | Check GTFS database health and last update time |
-| `/refreshtimetable` | Manually trigger a GTFS data refresh from data.gov.rs |
+## Setup & Running the Bot
+You can access the bot on telegram using this link
+https://t.me/BusTrackerBG_bot
 
-## Setup
+If you want to run the bot yourself follow the instructions below
 
 ### Prerequisites
 - Python 3.8+
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
-### Bot Access
-You can add the bot to your telegram through the [Telegram Link](t.me/BusTrackerBG_bot)
-
-If you want to run it yourself follow the installation below
-
-|
-v
-
 ### Installation
 
-1. Clone the repo:
+1. Clone the project:
 ```bash
 git clone https://github.com/hightsee/BusTrackerBG
 cd BusTrackerBG
 ```
 
-2. Install dependencies:
+2. Install the required Python packages:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Create your `.env` file:
+3. Set up your environment variables:
 ```bash
 cp .env.example .env
 ```
+Open the `.env` file and paste your Telegram bot token next to `BOT_TOKEN=`.
 
-4. Fill in your `.env` file:
-```
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-```
-
-5. Run the bot:
+4. Start the bot:
 ```bash
 python bus_bot.py
 ```
 
-## Environment Variables
-
-See `.env.example` for all required variables.
-
-## How It Works
-
-The Beograd Plus API uses AES-256-CBC encryption for its requests and responses. This bot handles the encryption and decryption automatically using the publicly available API credentials from the [bgpp](https://github.com/MikMik1011/bgpp) open source project.
-
 ## Credits
-
-- API reverse engineering by [MikMik1011](https://github.com/MikMik1011/bgpp)
-- Live transport data provided by [Beograd Plus](https://www.beograd.rs)
+- Original API reverse engineering by [MikMik1011](https://github.com/MikMik1011/bgpp) 
+- Static GTFS Timetable Data provided by [data.gov.rs](https://data.gov.rs/)
 
 ## License
-
 MIT
