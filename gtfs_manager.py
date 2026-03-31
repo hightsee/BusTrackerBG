@@ -6,9 +6,14 @@ import tempfile
 import os
 import requests
 import logging
+import pytz
 from datetime import datetime
 from typing import List, Optional, Dict, Any, cast
 from config import GTFS_DB, GTFS_URL
+
+def get_belgrade_time() -> datetime:
+    tz = pytz.timezone('Europe/Belgrade')
+    return datetime.now(tz)
 
 
 class GTFSManager:
@@ -55,7 +60,7 @@ class GTFSManager:
                 
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", ("last_update", datetime.now().isoformat()))
+            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", ("last_update", get_belgrade_time().isoformat()))
             conn.commit()
             conn.close()
             logging.info("GTFS update completed successfully.")
@@ -160,7 +165,7 @@ class GTFSManager:
 
     def is_data_outdated(self) -> bool:
         """Returns True if today's date is outside the GTFS calendar range."""
-        today_str = datetime.now().strftime('%Y%m%d')
+        today_str = get_belgrade_time().strftime('%Y%m%d')
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT MIN(start_date), MAX(end_date) FROM calendar")
@@ -187,7 +192,7 @@ class GTFSManager:
 
     def predict_bus_position(self, line_number: str, current_time_obj: Optional[datetime] = None) -> List[Dict[str, Any]]:
         if current_time_obj is None:
-            current_time_obj = datetime.now()
+            current_time_obj = get_belgrade_time()
             
         service_ids = self._get_active_service_ids(current_time_obj)
         if not service_ids:
@@ -292,7 +297,7 @@ class GTFSManager:
         from api_client import fetch_stations_list, normalize_text
         
         if current_time_obj is None:
-            current_time_obj = datetime.now()
+            current_time_obj = get_belgrade_time()
             
         service_ids = self._get_active_service_ids(current_time_obj)
         if not service_ids:
@@ -358,7 +363,6 @@ class GTFSManager:
             line_filter = f"AND r.route_short_name IN ({lp})"
             params.extend(line_numbers)
             
-            # 2. Query arrivals for ALL matched stop_ids and combine the results
         query = f"""
             SELECT r.route_short_name, st.arrival_time, t.trip_headsign, st.trip_id
             FROM stop_times st
@@ -369,6 +373,32 @@ class GTFSManager:
         """
         cursor.execute(query, params)
         rows = cursor.fetchall()
+        
+        # Spatial fallback if the GTFS stop is dead (0 scheduled trips) but has coordinates
+        if not rows and matched_stop_ids:
+            # Take the coordinates of the first matched stop
+            cursor.execute("SELECT stop_lat, stop_lon FROM stops WHERE stop_id = ?", (matched_stop_ids[0],))
+            coords = cursor.fetchone()
+            if coords and coords['stop_lat'] and coords['stop_lon']:
+                nearby = self.get_stops_nearby(coords['stop_lat'], coords['stop_lon'], 250)
+                nearby_ids = [str(nb['stop_id']) for nb in nearby if str(nb['stop_id']) not in matched_stop_ids]
+                if nearby_ids:
+                    placeholders_stops = ', '.join(['?'] * len(nearby_ids))
+                    params = nearby_ids + service_ids
+                    if line_numbers:
+                        params.extend(line_numbers)
+                    query = f"""
+                        SELECT r.route_short_name, st.arrival_time, t.trip_headsign, st.trip_id
+                        FROM stop_times st
+                        JOIN trips t ON st.trip_id = t.trip_id
+                        JOIN routes r ON t.route_id = r.route_id
+                        WHERE st.stop_id IN ({placeholders_stops}) AND t.service_id IN ({placeholders_services}) {line_filter}
+                        ORDER BY st.arrival_time
+                    """
+                    cursor.execute(query, params)
+                    rows = cursor.fetchall()
+                    if rows:
+                        display_stop_name += " (obližnje/nearby)"
         
         arrivals = []
         line_counts: Dict[str, int] = {}
@@ -556,7 +586,7 @@ class GTFSManager:
         return results
 
     def get_timetable(self, line_no: str) -> str:
-        now = datetime.now()
+        now = get_belgrade_time()
         day_eng = now.strftime('%A').lower()
         today_str = now.strftime('%Y%m%d')
 

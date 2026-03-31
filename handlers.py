@@ -17,6 +17,22 @@ async def reply_with_footer(message, text, **kwargs):
         text += FOOTER
     await message.reply_text(text, **kwargs)
 
+async def split_and_send_message(message, text, limit=3500):
+    lines = text.split('\n')
+    current_chunk = []
+    current_len = 0
+    for line in lines:
+        if current_len + len(line) + 1 > limit:
+            if current_chunk:
+                await reply_with_footer(message, "\n".join(current_chunk), parse_mode='HTML')
+            current_chunk = [line]
+            current_len = len(line) + 1
+        else:
+            current_chunk.append(line)
+            current_len += len(line) + 1
+    if current_chunk:
+        await reply_with_footer(message, "\n".join(current_chunk), parse_mode='HTML')
+
 async def resolve_station_identifier(user_id: str, identifier: str) -> Dict[str, Any]:
     """
     Legacy resolver - used only by old components. New nextat avoids this.
@@ -92,13 +108,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = f"📊 <b>Ukupno korisnika: {total_users}</b>\n\n" + "\n".join(user_list)
         report_str = str(report)
         
-        if len(report_str) > 4000:
-            limit = 4000
-            for i in range(0, len(report_str), limit):
-                chunk = "".join([report_str[j] for j in range(i, min(i + limit, len(report_str)))])
-                await reply_with_footer(update.message, chunk, parse_mode='HTML')
-        else:
-            await reply_with_footer(update.message, report_str, parse_mode='HTML')
+        await split_and_send_message(update.message, report_str)
     except Exception as e:
         logging.error(f"Error in users_command handler: {e}")
         await reply_with_footer(update.message, "Došlo je do greške prilikom preuzimanja liste korisnika.")
@@ -324,7 +334,8 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parts.append(f"🏁 Prva stanica / First stop: {b['next_stop']} (@ {b['arrival_time']})")
                 parts.append(f"⏱️ Kreće za / Starts in: {b['mins_until']} min\n")
                 
-        await reply_with_footer(update.message, "\n".join(parts), parse_mode='HTML')
+        text = "\n".join(parts)
+        await split_and_send_message(update.message, text)
     except Exception as e:
         logging.error(f"Error in predict_command: {e}")
         if update.message:
@@ -423,13 +434,7 @@ async def route_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parts.append(f"• {s['stop_name']} (<code>{s['stop_id']}</code>)")
             
             text = "\n".join(parts)
-            if len(text) > 4000:
-                limit = 4000
-                for i in range(0, len(text), limit):
-                    chunk = "".join([text[j] for j in range(i, min(i + limit, len(text)))])
-                    await reply_with_footer(update.message, chunk, parse_mode='HTML')
-            else:
-                await reply_with_footer(update.message, text, parse_mode='HTML')
+            await split_and_send_message(update.message, text)
     except Exception as e:
         logging.error(f"Error in route_command: {e}")
         if update.message:
