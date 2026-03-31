@@ -7,3 +7,5 @@ Flask
 flask-cors
 PyJWT
 bcrypt
+flask-limiter
+waitress

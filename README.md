@@ -63,6 +63,22 @@ Open the `.env` file and paste your Telegram bot token next to `BOT_TOKEN=`.
 python bus_bot.py
 ```
 
+## 🛡️ Production & Security
+
+The API runs using `waitress`, a production-ready server. However, it does not natively support HTTPS.
+
+### Important: Securing Your API
+To protect user credentials and JWTs from interception, **you must use a reverse proxy** to handle SSL/TLS:
+- **Nginx**: Recommended for Linux servers.
+- **Caddy**: Simple and automatic SSL.
+- **Cloudflare Tunnel**: Easy to set up if you don't have a static IP.
+- **ngrok**: Good for quick testing with HTTPS for development.
+
+**Environment Configuration:**
+- Set `API_HOST=127.0.0.1` (default) when using a reverse proxy on the same machine.
+- Generate a unique `JWT_SECRET` in your `.env` file (the bot will generate a random one if missing).
+- Set `ALLOWED_ORIGINS` to only allow your trusted front-end domains.
+
 ## Credits
 - Original API reverse engineering by [MikMik1011](https://github.com/MikMik1011/bgpp) 
 - Static GTFS Timetable Data provided by [data.gov.rs](https://data.gov.rs/)

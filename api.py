@@ -6,6 +6,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import jwt
 import bcrypt
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # Import existing logic from bus_bot.py
 # Note: Since bus_bot.py's polling is protected by if __name__ == '__main__', 
@@ -18,15 +20,27 @@ from bus_bot import (
     get_arrivals,
     find_station_id_by_uid,
     find_station_uid,
-    BOT_TOKEN
+    BOT_TOKEN,
+    JWT_SECRET,
+    ALLOWED_ORIGINS,
+    API_HOST,
+    API_PORT
 )
 
 app = Flask(__name__)
-# Enable CORS for all origins
-CORS(app)
+# Restrict CORS to specific origins from configuration
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
-# Use the bot token as the secret key for JWT (or define a new one in .env)
-app.config['SECRET_KEY'] = os.getenv('JWT_SECRET', BOT_TOKEN)
+# Initialize Rate Limiter
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["300 per day", "100 per hour"],
+    storage_uri="memory://",
+)
+
+# Use the secure JWT secret from config
+app.config['SECRET_KEY'] = JWT_SECRET
 START_TIME = time.time()
 
 # ---------------------------------------------------------------------------
@@ -47,8 +61,13 @@ def token_required(f):
             current_user = bot_data_manager.get_api_user(data['username'])
             if not current_user:
                 return jsonify({'error': 'Invalid Token!'}), 401
-        except Exception as e:
-            return jsonify({'error': 'Token is invalid!', 'details': str(e)}), 401
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token has expired!'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid Token!'}), 401
+        except Exception:
+            # Avoid leaking raw exception strings to the client
+            return jsonify({'error': 'Authentication failed!'}), 401
 
         return f(current_user, *args, **kwargs)
 
@@ -68,6 +87,7 @@ def health_check():
     }), 200
 
 @app.route('/api/register', methods=['POST'])
+@limiter.limit("5 per minute")
 def register():
     data = request.get_json()
     if not data or not data.get('username') or not data.get('password'):
@@ -86,6 +106,7 @@ def register():
         return jsonify({'error': 'Username already taken'}), 409
 
 @app.route('/api/login', methods=['POST'])
+@limiter.limit("10 per minute")
 def login():
     data = request.get_json()
     if not data or not data.get('username') or not data.get('password'):
@@ -288,6 +309,12 @@ def remove_favorite(current_user, name):
         return jsonify({'error': 'Favorite not found'}), 404
 
 if __name__ == '__main__':
-    # When running directly, BotDataManager has already initialized and fixed IDs
-    # and GTFS has started.
-    app.run(host='0.0.0.0', port=5000)
+    from waitress import serve
+    # Use a production-ready server
+    print("\n" + "!" * 80)
+    print("! SECURITY WARNING: This API is currently running over plain HTTP.")
+    print("! For production deployments, you MUST use a reverse proxy (like Nginx/Caddy)")
+    print("! with an SSL certificate to enable HTTPS and prevent credential theft.")
+    print("!" * 80 + "\n")
+    print(f"Starting production server on {API_HOST}:{API_PORT}...")
+    serve(app, host=API_HOST, port=API_PORT)

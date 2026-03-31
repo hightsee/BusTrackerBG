@@ -142,10 +142,16 @@ class GTFSManager:
 
     def _get_active_service_ids(self, date_obj: datetime) -> List[str]:
         day_eng = date_obj.strftime('%A').lower()
+        # Security: Whitelist day_eng to prevent SQL injection as it cannot be parameterized as a column name
+        valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+        if day_eng not in valid_days:
+            return []
+            
         date_str = date_obj.strftime('%Y%m%d')
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        # Parameterize only the date values; column names must be from the whitelist
         query = f"SELECT service_id FROM calendar WHERE {day_eng} = 1 AND start_date <= ? AND end_date >= ?"
         cursor.execute(query, (date_str, date_str))
         service_ids = [r[0] for r in cursor.fetchall()]
@@ -580,6 +586,12 @@ class GTFSManager:
         route_id, route_long_name = route
 
         # Strictly today's service IDs
+        day_eng = now.strftime('%A').lower()
+        # Security: Whitelist day_eng
+        valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+        if day_eng not in valid_days:
+            return f"Nije moguće utvrditi dan u nedelji: {day_eng}"
+
         query = f"SELECT service_id FROM calendar WHERE {day_eng} = 1 AND start_date <= ? AND end_date >= ?"
         cursor.execute(query, (today_str, today_str))
         service_ids = [r[0] for r in cursor.fetchall()]

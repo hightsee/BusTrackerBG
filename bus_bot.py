@@ -3,7 +3,7 @@ import threading
 from telegram.ext import ApplicationBuilder, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from config import BOT_TOKEN
+from config import BOT_TOKEN, JWT_SECRET, ALLOWED_ORIGINS, API_HOST, API_PORT
 from db_manager import bot_data_manager
 from gtfs_manager import gtfs_manager
 import handlers
