@@ -2955,7 +2955,19 @@ function focusActiveOverlay() {
   (focusables[0] || dialog).focus({ preventScroll: true });
 }
 
+function scrollMainToTop() {
+  if (!contentArea) {
+    return;
+  }
+
+  requestAnimationFrame(() => {
+    contentArea.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+  });
+}
+
 function renderView(viewName) {
+  const viewChanged = state.currentView !== viewName;
   let focusState = null;
   const activeElement = document.activeElement;
   if (
@@ -2988,6 +3000,10 @@ function renderView(viewName) {
         nextInput.setSelectionRange(focusState.selectionStart, focusState.selectionEnd);
       }
     }
+  }
+
+  if (viewChanged && !focusState) {
+    scrollMainToTop();
   }
 }
 
