@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="sr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Live Belgrade public transport search, nearby stops, saved stops, and route planning.">
+    <meta property="og:title" content="Bus Tracker BG">
+    <meta property="og:description" content="Find Belgrade stops, departures, and route options from a compact map-first interface.">
+    <title>Bus Tracker BG</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <a class="skip-link" href="#content-area">Skip to content</a>
+    <div id="app">
+        <header class="app-header">
+            <a class="app-logo" href="#" data-target="home" aria-label="BelgradeBusTracker home">
+                <img src="assets/logo.svg" alt="BelgradeBusTracker">
+                <span>BeogradskiBusTracker</span>
+            </a>
+        </header>
+        <main id="content-area">
+            <!-- Content will be injected here -->
+        </main>
+
+        <div id="map"></div>
+        
+        <nav id="bottom-nav">
+            <button class="nav-btn active" data-target="home" aria-label="Home">
+                <i data-lucide="house"></i>
+                <span>Home</span>
+            </button>
+            <button class="nav-btn" data-target="search" aria-label="Search">
+                <i data-lucide="search"></i>
+                <span>Search</span>
+            </button>
+            <button class="nav-btn" data-target="navigate" aria-label="Routes">
+                <i data-lucide="navigation"></i>
+                <span>Routes</span>
+            </button>
+            <button class="nav-btn" data-target="favorites" aria-label="Saved">
+                <i data-lucide="star"></i>
+                <span>Saved</span>
+            </button>
+            <button class="nav-btn" data-target="profile" aria-label="Profile">
+                <i data-lucide="user"></i>
+                <span>Profile</span>
+            </button>
+        </nav>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
