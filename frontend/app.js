@@ -20,6 +20,8 @@ import Search from 'lucide/dist/esm/icons/search.js';
 import Star from 'lucide/dist/esm/icons/star.js';
 import User from 'lucide/dist/esm/icons/user.js';
 import UserPlus from 'lucide/dist/esm/icons/user-plus.js';
+import X from 'lucide/dist/esm/icons/x.js';
+import Maximize2 from 'lucide/dist/esm/icons/maximize-2.js';
 
 const lucideIcons = {
   ArrowLeft,
@@ -40,7 +42,9 @@ const lucideIcons = {
   Search,
   Star,
   User,
-  UserPlus
+  UserPlus,
+  X,
+  Maximize2
 };
 
 function createAppIcons() {
@@ -51,12 +55,13 @@ function createAppIcons() {
 
 const API_URL = '/api';
 const AUTH_TOKEN_KEY = 'token';
+const LOCAL_FAVORITES_KEY = 'localFavorites';
 const DEFAULT_CENTER = { lat: 44.8176, lon: 20.4569 };
 const STATION_BOUNDS = [
   [44.3691, 20.0908],
   [45.0770, 20.7277]
 ];
-const NAV_VIEWS = new Set(['home', 'search', 'navigate', 'favorites', 'profile']);
+const NAV_VIEWS = new Set(['home', 'navigate', 'favorites']);
 const TRAM_LINES = new Set(['2', '3', '5', '6', '7', '9', '10', '11', '12', '13', '14']);
 const NAV_LOCATION_INITIAL_LIMIT = 6;
 const NAV_LOCATION_RETRY_LIMIT = 10;
@@ -108,10 +113,12 @@ const state = {
   routeLine: '',
   routeMessage: 'Select a line to draw its route on the map.',
   activeSheet: '',
-  mapPickMode: false,
+  searchHelpOpen: false,
   mapPickCandidate: null,
+  mapPickSelectedLines: [],
   mapPickOptions: [],
   mapPickMessage: '',
+  mapExpanded: false,
   favoriteChoiceStop: null,
   editingFavoriteName: '',
   favoriteEditMessage: '',
@@ -128,6 +135,11 @@ let appShell;
 let map;
 let navFromRequestId = 0;
 let navToRequestId = 0;
+let searchRequestId = 0;
+let mapPickRequestId = 0;
+let mapFocusRequestId = 0;
+let mapFocusTimer = null;
+let suppressMapFocusUntil = 0;
 let navFromInputTimer = null;
 let navToInputTimer = null;
 const navFromSuggestionsCache = new Map();
@@ -169,6 +181,61 @@ function loadFavoriteUsage() {
   } catch (error) {
     return {};
   }
+}
+
+function loadLocalFavorites() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LOCAL_FAVORITES_KEY) || '[]');
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.map((favorite) => normalizeStop(favorite)).filter((favorite) => favorite.stationId);
+  } catch (error) {
+    return [];
+  }
+}
+
+function saveLocalFavorites(favorites) {
+  localStorage.setItem(LOCAL_FAVORITES_KEY, JSON.stringify(favorites.map((favorite) => ({
+    station_id: favorite.stationId,
+    stop_id: favorite.rawStopId,
+    name: favorite.favoriteName || favorite.name,
+    favoriteName: favorite.favoriteName || favorite.name,
+    stop_lat: favorite.lat,
+    stop_lon: favorite.lon,
+    presetLine: normalizeLineList(favorite.presetLine || '')
+  }))));
+}
+
+function upsertLocalFavorite(favorite) {
+  const normalizedFavorite = normalizeStop(favorite);
+  const favoriteName = normalizedFavorite.favoriteName || normalizedFavorite.name;
+  const presetLine = normalizeLineList(normalizedFavorite.presetLine || '');
+  const nextFavorite = {
+    ...normalizedFavorite,
+    favoriteName,
+    presetLine
+  };
+  const existingFavorites = loadLocalFavorites();
+  const nextFavorites = [
+    nextFavorite,
+    ...existingFavorites.filter((item) => !(
+      item.stationId === nextFavorite.stationId
+      && normalizeLineList(item.presetLine || '') === presetLine
+    ))
+  ].slice(0, 20);
+  saveLocalFavorites(nextFavorites);
+  return nextFavorites;
+}
+
+function removeLocalFavorite(name) {
+  const normalizedName = String(name || '').trim();
+  const nextFavorites = loadLocalFavorites().filter((favorite) =>
+    String(favorite.favoriteName || favorite.name || '').trim() !== normalizedName
+  );
+  saveLocalFavorites(nextFavorites);
+  return nextFavorites;
 }
 
 function favoriteUsageKey(favorite) {
@@ -331,12 +398,12 @@ async function validateLineList(value) {
 
 const translations = {
   sr: {
-    navHome: 'Pocetna',
+    navHome: 'Polasci',
     navSearch: 'Pretraga',
-    navNavigate: 'Rute',
+    navNavigate: 'Ruta',
     navFavorites: 'Sacuvano',
     navProfile: 'Profil',
-    searchInitial: 'Stanice u blizini adrese ce se pojaviti ovde.',
+    searchInitial: 'Unesite broj stanice, liniju i stanicu, naziv ili adresu.',
     nearbyLoading: 'Ucitavanje stanica oko centra Beograda...',
     loadingFavorites: 'Ucitavanje sacuvanih stanica...',
     loadingDepartures: 'Ucitavanje polazaka...',
@@ -348,8 +415,8 @@ const translations = {
     register: 'Registracija',
     remove: 'Ukloni',
     removeFavorite: 'Ukloni iz sacuvanih',
-    searchStops: 'Pretraga stanica',
-    navigate: 'Navigacija',
+    searchStops: 'Polasci',
+    navigate: 'Ruta',
     fromStop: 'Polaziste',
     toStop: 'Odrediste',
     routeSearchHint: 'Unesite broj stanice, naziv stanice ili adresu za polaziste i odrediste.',
@@ -364,6 +431,7 @@ const translations = {
     walk: 'pesacenje',
     nextFromOrigin: 'Sledeci polasci sa polazista',
     nextFromTransfer: 'Sledeci polasci za presedanje',
+    approxRideTime: '≈ {minutes} min voznje',
     showOnMap: 'Prikazi na mapi',
     saveRoute: 'Sacuvaj rutu',
     routeSaved: 'Ruta je sacuvana u favorite.',
@@ -373,17 +441,23 @@ const translations = {
     findingRoutes: 'Trazenje ruta...',
     noRoutesFound: 'Nema pronadjenih ruta za ove stanice.',
     search: 'Pretrazi',
-    searchPlaceholder: 'Unesite adresu u Beogradu',
+    searchPlaceholder: 'Stanica, adresa ili 58 182',
     linePlaceholder: 'Linija',
     addressSearchHint: 'Unesite adresu, ulicu ili poznato mesto. Prikazace se najblize stanice.',
-    homeSearchPlaceholder: 'Pretrazite stanice po adresi',
-    searchButton: 'Pretrazi po adresi',
-    homeTitle: 'Mapa prvo. Polasci odmah.',
-    homeIntro: 'Pronadjite stanicu, proverite linije i sacuvajte rute koje stvarno koristite kroz Beograd.',
+    homeSearchPlaceholder: 'Stanica, adresa ili 58 182',
+    searchButton: 'Nadji polaske',
+    homeTitle: 'Polasci',
+    homeIntro: 'Unesite broj stanice, naziv, adresu ili liniju sa stanicom.',
+    searchHelp: 'Mozete uneti broj stanice (182), liniju i stanicu (58 182), naziv stanice ili adresu.',
+    searchHelpTitle: 'Sta mozete uneti',
+    searchHelpStopExample: '182',
+    searchHelpLineStopExample: '58 182',
+    searchHelpPlaceExample: 'Studentski trg',
+    searchHelpAddressExample: 'Kneza Milosa',
     serviceStatus: 'GTFS + lokalna predvidjanja',
     mapCaption: 'Aktivna mapa stajalista',
     useLocation: 'Moja lokacija',
-    chooseOnMap: 'Izaberi na mapi',
+    openMap: 'Mapa',
     nearbyStops: 'Stanice u blizini',
     refresh: 'Osvezi',
     savedStops: 'Sacuvane stanice',
@@ -418,18 +492,18 @@ const translations = {
     goBack: 'Nazad',
     saveFavorite: 'Sacuvaj',
     favoriteLabel: 'Naziv favorita',
-    loginToSave: 'Prijavite se da sacuvate stanicu',
+    loginToSave: 'Sacuvaj stanicu',
     upcomingDepartures: 'Sledeci polasci',
     lineRoute: 'Trasa linije',
     noLineSelected: 'Nije izabrana linija',
     showRoute: 'Trasa',
     line: 'Linija',
     noDepartures60: 'Nema zakazanih polazaka u narednih 60 minuta.',
-    selectLines: 'Izaberite jednu ili vise linija. Prikazuju se polasci u narednih 60 minuta.',
+    selectLines: 'Dodirnite liniju ako zelite da suzite prikaz.',
     noSelectedDepartures: 'Nema polazaka za izabrane linije u narednih 60 minuta.',
     directionUnavailable: 'Smer nije dostupan',
-    noFavoritesPublic: 'Za sacuvane stanice je potreban nalog, ali ostatak aplikacije radi bez prijave.',
-    favoritesRequireLogin: 'Za sacuvane stanice je potrebna prijava.',
+    noFavoritesPublic: 'Sacuvane stanice ce se pojaviti ovde.',
+    favoritesRequireLogin: 'Sacuvane stanice ce se pojaviti ovde.',
     noFavorites: 'Jos nema sacuvanih stanica.',
     enterStop: 'Unesite adresu.',
     searchingStops: 'Trazenje stanica u blizini adrese...',
@@ -441,7 +515,7 @@ const translations = {
     aroundLocation: 'Oko vase trenutne lokacije',
     locationFailed: 'Lokacija nije dostupna. Prikazujem centar Beograda.',
     noStopsArea: 'Nema stanica u ovoj oblasti.',
-    noPredictions: 'Nema dostupnih predvidjenih polazaka.',
+    noPredictions: 'Nema pronadjenih polazaka za ovu stanicu.',
     stopMissing: 'Nedostaje identifikator stanice.',
     loadingRoute: 'Ucitavanje trase...',
     showingRoute: 'Prikazana je trasa',
@@ -475,7 +549,6 @@ const translations = {
     allLines: 'Sve',
     pickMapPoint: 'Izaberi na mapi',
     pickLocationOnMap: 'Izaberi lokaciju na mapi',
-    pickMapHint: 'Kliknite na mapu za stanice u blizini.',
     pickedMapPoint: 'Izabrana tacka na mapi',
     chooseNearbyStop: 'Izaberite stanicu u blizini',
     selectedStop: 'Izabrana stanica',
@@ -499,12 +572,12 @@ const translations = {
     ,useSuggestedStation: 'Koristi predlog'
   },
   en: {
-    navHome: 'Home',
+    navHome: 'Departures',
     navSearch: 'Search',
-    navNavigate: 'Routes',
+    navNavigate: 'Route',
     navFavorites: 'Saved',
     navProfile: 'Profile',
-    searchInitial: 'Stops near the address will appear here.',
+    searchInitial: 'Enter a stop number, line and stop, stop name, or address.',
     nearbyLoading: 'Loading stops around central Belgrade...',
     loadingFavorites: 'Loading favorites...',
     loadingDepartures: 'Loading departures...',
@@ -516,8 +589,8 @@ const translations = {
     register: 'Register',
     remove: 'Remove',
     removeFavorite: 'Remove from favorites',
-    searchStops: 'Search Stops',
-    navigate: 'Navigation',
+    searchStops: 'Departures',
+    navigate: 'Route',
     fromStop: 'Start point',
     toStop: 'End point',
     routeSearchHint: 'Enter a station number, station name, or address for the start and destination.',
@@ -532,6 +605,7 @@ const translations = {
     walk: 'walk',
     nextFromOrigin: 'Next departures from start',
     nextFromTransfer: 'Next transfer departures',
+    approxRideTime: '≈ {minutes} min ride',
     showOnMap: 'Show on map',
     saveRoute: 'Save route',
     routeSaved: 'Route saved to favorites.',
@@ -541,17 +615,23 @@ const translations = {
     findingRoutes: 'Finding routes...',
     noRoutesFound: 'No routes found for those stops.',
     search: 'Search',
-    searchPlaceholder: 'Enter a Belgrade address',
+    searchPlaceholder: 'Stop, address, or 58 182',
     linePlaceholder: 'Line',
     addressSearchHint: 'Enter an address, street, or landmark. Nearby stops will be shown.',
-    homeSearchPlaceholder: 'Search stops by address',
-    searchButton: 'Search by address',
-    homeTitle: 'Map first. Departures now.',
-    homeIntro: 'Find a stop, check the lines, and keep the Belgrade routes you actually use close at hand.',
+    homeSearchPlaceholder: 'Stop, address, or 58 182',
+    searchButton: 'Find departures',
+    homeTitle: 'Departures',
+    homeIntro: 'Enter a stop number, stop name, address, or a line with a stop.',
+    searchHelp: 'You can enter a stop number (182), line and stop (58 182), stop name, or address.',
+    searchHelpTitle: 'What you can enter',
+    searchHelpStopExample: '182',
+    searchHelpLineStopExample: '58 182',
+    searchHelpPlaceExample: 'Studentski trg',
+    searchHelpAddressExample: 'Kneza Milosa',
     serviceStatus: 'GTFS + local predictions',
     mapCaption: 'Live stop map',
     useLocation: 'Use my location',
-    chooseOnMap: 'Choose on map',
+    openMap: 'Map',
     nearbyStops: 'Nearby Stops',
     refresh: 'Refresh',
     savedStops: 'Saved Stops',
@@ -586,18 +666,18 @@ const translations = {
     goBack: 'Go back',
     saveFavorite: 'Save',
     favoriteLabel: 'Favorite label',
-    loginToSave: 'Log in to save this stop',
+    loginToSave: 'Save stop',
     upcomingDepartures: 'Upcoming Departures',
     lineRoute: 'Line Route',
     noLineSelected: 'No line selected',
     showRoute: 'Show route',
     line: 'Line',
     noDepartures60: 'No departures are scheduled in the next 60 minutes.',
-    selectLines: 'Select one or more lines first. Only departures in the next 60 minutes will be shown.',
+    selectLines: 'Tap a line if you want to narrow the list.',
     noSelectedDepartures: 'No departures for the selected lines in the next 60 minutes.',
     directionUnavailable: 'Direction unavailable',
-    noFavoritesPublic: 'Favorites require an account, but the rest of the app stays usable without logging in.',
-    favoritesRequireLogin: 'Favorites require login.',
+    noFavoritesPublic: 'Saved stops will appear here.',
+    favoritesRequireLogin: 'Saved stops will appear here.',
     noFavorites: 'No saved stops yet.',
     enterStop: 'Enter an address.',
     searchingStops: 'Finding stops near that address...',
@@ -609,7 +689,7 @@ const translations = {
     aroundLocation: 'Around your current location',
     locationFailed: 'Location access failed. Showing central Belgrade instead.',
     noStopsArea: 'No stops were found in this area.',
-    noPredictions: 'No predicted departures are available.',
+    noPredictions: 'No departures found for this stop right now.',
     stopMissing: 'Stop identifier is missing.',
     loadingRoute: 'Loading route geometry...',
     showingRoute: 'Showing route',
@@ -643,7 +723,6 @@ const translations = {
     allLines: 'All',
     pickMapPoint: 'Pick on map',
     pickLocationOnMap: 'Choose a location on the map',
-    pickMapHint: 'Click the map for nearby stops.',
     pickedMapPoint: 'Picked map point',
     chooseNearbyStop: 'Choose a nearby stop',
     selectedStop: 'Selected stop',
@@ -738,9 +817,9 @@ function isAuthenticated() {
 
 function logout() {
   clearToken();
-  state.favorites = [];
-  state.favoritesMessage = t('favoritesRequireLogin');
-  renderView('profile');
+  state.favorites = loadLocalFavorites();
+  state.favoritesMessage = state.favorites.length ? '' : t('noFavorites');
+  renderView('favorites');
 }
 
 function formatPublicStopId(stopId) {
@@ -918,7 +997,7 @@ async function getStopDetails(stop) {
 
 async function showStopChoice(stop) {
   state.mapPickCandidate = await getStopDetails(stop);
-  state.mapPickMode = false;
+  state.mapPickSelectedLines = [];
   state.mapPickOptions = [];
   state.mapPickMessage = '';
   renderView(state.currentView);
@@ -1048,29 +1127,8 @@ function ensureMap() {
     maxZoom: 19
   }).addTo(map);
 
-  map.on('click', async (event) => {
-    if (!state.mapPickMode) {
-      return;
-    }
-
-    const coords = { lat: event.latlng.lat, lon: event.latlng.lng };
-    state.locationMarker.clearLayers();
-    renderDroppedPin(coords);
-
-    try {
-      const data = await apiRequest(`/stops/nearby?lat=${coords.lat}&lon=${coords.lon}&radius=450`);
-      state.mapPickOptions = (data.stops || []).map(normalizeStop).slice(0, 8);
-      state.mapPickMessage = state.mapPickOptions.length ? '' : t('noStopsArea');
-      renderStopsOnMap(state.mapPickOptions, false);
-      renderDroppedPin(coords);
-      state.mapPickMode = false;
-    } catch (error) {
-      state.mapPickOptions = [];
-      state.mapPickMessage = error.message;
-      state.mapPickMode = false;
-    }
-
-    renderView(state.currentView);
+  map.on('moveend zoomend', () => {
+    scheduleMapFocusStops();
   });
 }
 
@@ -1108,11 +1166,35 @@ function renderUserLocationOnMap(coords) {
     .bindPopup(escapeHtml(t('currentLocationStart')));
 }
 
+function renderWalkLineOnMap(fromCoords, toStop, label = '') {
+  if (!map || !fromCoords || !hasCoordinates(toStop)) {
+    return;
+  }
+
+  const fromLat = Number(fromCoords.lat);
+  const fromLon = Number(fromCoords.lon);
+  if (!Number.isFinite(fromLat) || !Number.isFinite(fromLon)) {
+    return;
+  }
+
+  L.polyline([[fromLat, fromLon], [toStop.lat, toStop.lon]], {
+    color: '#287460',
+    weight: 4,
+    opacity: 0.72,
+    dashArray: '7 8'
+  })
+    .addTo(state.routeLayer)
+    .bindPopup(escapeHtml(label || t('walk')));
+}
+
 function renderStopsOnMap(stops, fitBounds = true) {
   if (!map) {
     return;
   }
 
+  if (fitBounds) {
+    suppressMapFocusUntil = Date.now() + 900;
+  }
   clearMapLayers();
   const validStops = stops.filter(hasCoordinates);
 
@@ -1133,6 +1215,91 @@ function renderStopsOnMap(stops, fitBounds = true) {
     map.fitBounds(bounds.pad(0.2));
   } else if (validStops.length === 1) {
     map.setView([validStops[0].lat, validStops[0].lon], 16);
+  }
+}
+
+function shouldUseMapFocusStops() {
+  const mapFinderActive = state.currentView === 'search'
+    || (state.currentView === 'home' && state.mapExpanded);
+  return Boolean(map && mapFinderActive && !state.mapPickCandidate && !state.favoriteChoiceStop);
+}
+
+function getMapFocusRadius() {
+  if (!map) {
+    return 650;
+  }
+
+  const center = map.getCenter();
+  const bounds = map.getBounds();
+  const northEast = bounds.getNorthEast();
+  const radius = center.distanceTo(northEast) * 0.72;
+  if (!Number.isFinite(radius)) {
+    return 650;
+  }
+
+  return Math.round(Math.min(Math.max(radius, 500), 1800));
+}
+
+function scheduleMapFocusStops() {
+  if (!shouldUseMapFocusStops()) {
+    return;
+  }
+  if (Date.now() < suppressMapFocusUntil) {
+    return;
+  }
+
+  window.clearTimeout(mapFocusTimer);
+  mapFocusTimer = window.setTimeout(() => {
+    loadStopsForMapFocus();
+  }, 300);
+}
+
+async function loadStopsForMapFocus() {
+  if (!shouldUseMapFocusStops()) {
+    return;
+  }
+  if (Date.now() < suppressMapFocusUntil) {
+    return;
+  }
+
+  const center = map.getCenter();
+  const requestId = ++mapFocusRequestId;
+  const coords = { lat: center.lat, lon: center.lng };
+  const radius = getMapFocusRadius();
+  const label = t('mapCaption');
+
+  try {
+    const data = await apiRequest(`/stops/nearby?lat=${coords.lat}&lon=${coords.lon}&radius=${radius}`);
+    if (requestId !== mapFocusRequestId || !shouldUseMapFocusStops()) {
+      return;
+    }
+
+    const stops = (data.stops || []).map(normalizeStop);
+    state.nearbyStops = stops;
+    state.nearbyCenterLabel = label;
+    state.nearbyMessage = stops.length ? '' : t('noStopsArea');
+
+    if (state.currentView === 'search') {
+      state.searchResults = stops;
+      state.searchMessage = stops.length
+        ? `${stops.length} ${stops.length === 1 ? t('resultFound') : t('resultsFound')}`
+        : t('noStopsArea');
+      state.searchResultsExpanded = true;
+    }
+
+    renderStopsOnMap(stops.slice(0, 20), false);
+  } catch (error) {
+    if (requestId !== mapFocusRequestId || !shouldUseMapFocusStops()) {
+      return;
+    }
+    state.nearbyStops = [];
+    state.nearbyMessage = error.message;
+    if (state.currentView === 'search') {
+      state.searchResults = [];
+      state.searchMessage = error.message;
+      state.searchResultsExpanded = true;
+    }
+    clearMapLayers();
   }
 }
 
@@ -1192,6 +1359,7 @@ function renderRouteOnMap(directions) {
     return;
   }
 
+  suppressMapFocusUntil = Date.now() + 900;
   clearMapLayers();
   const colors = ['#378ADD'];
   const allPoints = [];
@@ -1361,8 +1529,35 @@ function formatRouteWalk(distanceMetersValue) {
   return `${Math.round(distance)} m`;
 }
 
+function estimateRideMinutes(route) {
+  const stops = Number(route?.stops_count || route?.total_stops_count || 0);
+  if (!Number.isFinite(stops) || stops <= 0) {
+    return 0;
+  }
+
+  return Math.max(3, Math.round(stops * 1.5));
+}
+
+function formatApproxRideTime(route) {
+  const minutes = estimateRideMinutes(route);
+  if (!minutes) {
+    return '';
+  }
+
+  return t('approxRideTime').replace('{minutes}', String(minutes));
+}
+
 function stationStopMeta(stationId, extra = '') {
   return [stationId ? `${t('stop')} ${stationId}` : '', extra].filter(Boolean).join(' · ');
+}
+
+function formatDisplayTime(value) {
+  const time = String(value || '').trim();
+  const match = time.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!match) {
+    return time;
+  }
+  return `${match[1].padStart(2, '0')}:${match[2]}`;
 }
 
 function renderRouteStationSegment({ name, stationId, icon = 'map-pin', className = '', meta = '' }) {
@@ -1460,10 +1655,30 @@ function renderDepartureRows(departures, transfer = false, showLine = false) {
     ? departures.slice(0, 3).map((departure) => `
       <div class="arrival-row">
         <span class="arrival-chip ${transfer ? 'arrival-chip--transfer' : ''}">${escapeHtml(departure.mins_remaining)} min</span>
-        <span>${showLine && departure.line ? `${escapeHtml(departure.line)} · ` : ''}${escapeHtml(departure.arrival_time)} · ${escapeHtml(departure.direction || '')}</span>
+        <span class="arrival-separator" aria-hidden="true"></span>
+        <span class="arrival-time">${showLine && departure.line ? `${escapeHtml(departure.line)} · ` : ''}${escapeHtml(formatDisplayTime(departure.arrival_time))}</span>
       </div>
     `).join('')
     : `<div class="settings-hint">${escapeHtml(t('noDepartures60'))}</div>`;
+}
+
+function renderSearchHelp() {
+  const examples = [
+    t('searchHelpStopExample'),
+    t('searchHelpLineStopExample'),
+    t('searchHelpPlaceExample'),
+    t('searchHelpAddressExample')
+  ];
+
+  return `
+    <div class="input-help-copy">
+      <strong>${escapeHtml(t('searchHelpTitle'))}</strong>
+      <span>${escapeHtml(t('searchHelp'))}</span>
+      <div class="input-help-examples">
+        ${examples.map((example) => `<code>${escapeHtml(example)}</code>`).join('')}
+      </div>
+    </div>
+  `;
 }
 
 function renderDepartureGroup(title, departures, transfer = false) {
@@ -1535,7 +1750,7 @@ function formatNextDepartureSummary(departures) {
     return t('noDepartures60');
   }
 
-  return `${next.mins_remaining} min · ${next.arrival_time}`;
+  return `${next.mins_remaining} min · ${formatDisplayTime(next.arrival_time)}`;
 }
 
 function renderRouteCollapsedMeta(route, departures) {
@@ -1648,6 +1863,7 @@ async function renderNavigationRouteOnMap(route) {
     return;
   }
 
+  suppressMapFocusUntil = Date.now() + 900;
   const routeStartStop = normalizeStop({
     station_id: route.from_station_id || route.origin_station_id || state.navFromStop?.stationId,
     stop_id: route.origin_stop_id || route.from_station_id || state.navFromStop?.rawStopId,
@@ -1738,6 +1954,14 @@ async function renderNavigationRouteOnMap(route) {
   if (state.navFromLocation) {
     renderUserLocationOnMap(state.navFromLocation);
     allPoints.push([Number(state.navFromLocation.lat), Number(state.navFromLocation.lon)]);
+    if (hasCoordinates(routeStartStop)) {
+      const walkMeters = Number(route.origin_walk_m ?? route.from_stop_distance ?? routeStartStop.distance ?? 0);
+      renderWalkLineOnMap(
+        state.navFromLocation,
+        routeStartStop,
+        walkMeters ? `${formatRouteWalk(walkMeters)} ${t('walk')}` : t('walk')
+      );
+    }
   }
 
   transferStops.forEach((transferStop) => {
@@ -1762,12 +1986,7 @@ function updateMapForCurrentView() {
     return;
   }
 
-  if (state.mapPickMode || state.mapPickCandidate || state.mapPickOptions.length || state.mapPickMessage) {
-    return;
-  }
-
-  if (state.currentView === 'home') {
-    renderStopsOnMap(state.nearbyStops.slice(0, 12), true);
+  if (state.mapPickCandidate || state.mapPickOptions.length || state.mapPickMessage) {
     return;
   }
 
@@ -1778,6 +1997,7 @@ function updateMapForCurrentView() {
       if (focusedStop) {
         setTimeout(() => {
           map.invalidateSize();
+          suppressMapFocusUntil = Date.now() + 900;
           map.setView([focusedStop.lat, focusedStop.lon], 16);
         }, 0);
       }
@@ -1807,6 +2027,16 @@ function updateMapForCurrentView() {
     return;
   }
 
+  if (state.currentView === 'home') {
+    if (state.nearbyStops.length) {
+      renderStopsOnMap(state.nearbyStops.slice(0, 20), true);
+    } else {
+      clearMapLayers();
+      map.setView([DEFAULT_CENTER.lat, DEFAULT_CENTER.lon], 13);
+    }
+    return;
+  }
+
   if (state.currentView === 'stop') {
     if (state.routeDirections.length) {
       renderRouteOnMap(state.routeDirections);
@@ -1815,6 +2045,7 @@ function updateMapForCurrentView() {
 
     if (state.currentStop && hasCoordinates(state.currentStop)) {
       renderStopsOnMap([state.currentStop], true);
+      suppressMapFocusUntil = Date.now() + 900;
       map.setView([state.currentStop.lat, state.currentStop.lon], 16);
       return;
     }
@@ -1826,8 +2057,14 @@ function updateMapForCurrentView() {
 
 function syncShell() {
   const standaloneAuth = state.currentView === 'auth';
-  const showMap = state.currentView === 'home' || state.currentView === 'search' || state.currentView === 'navigate' || state.currentView === 'stop';
-  const mapAnchor = document.getElementById('map-anchor');
+  const showMap = state.currentView === 'search'
+    || state.currentView === 'navigate'
+    || (state.currentView === 'stop' && state.routeDirections.length)
+    || state.mapExpanded;
+  const expandedMapAnchor = document.getElementById('map-expanded-anchor');
+  const mapAnchor = state.mapExpanded && expandedMapAnchor
+    ? expandedMapAnchor
+    : document.getElementById('map-anchor');
   if (!standaloneAuth && showMap && mapAnchor) {
     mapAnchor.appendChild(mapContainer);
   } else if (appShell && mapContainer.parentElement !== appShell) {
@@ -1838,6 +2075,7 @@ function syncShell() {
   bottomNav.style.display = standaloneAuth ? 'none' : '';
   document.body.classList.toggle('auth-page', standaloneAuth);
   document.body.classList.toggle('map-page', !standaloneAuth && showMap);
+  document.body.classList.toggle('map-expanded-page', Boolean(state.mapExpanded));
 
   if (map && !standaloneAuth && showMap) {
     setTimeout(() => map.invalidateSize(), 0);
@@ -1855,10 +2093,8 @@ function setActiveNav() {
 function updateNavLabels() {
   const labels = {
     home: t('navHome'),
-    search: t('navSearch'),
     navigate: t('navNavigate'),
-    favorites: t('navFavorites'),
-    profile: t('navProfile')
+    favorites: t('navFavorites')
   };
 
   document.querySelectorAll('.nav-btn').forEach((button) => {
@@ -2040,6 +2276,16 @@ function getAvailableArrivalLines() {
   ).sort(compareLineLabels);
 }
 
+function hasSelectedDepartureLine(line) {
+  const normalizedLine = String(line || '');
+  return state.selectedDepartureLines.map(String).includes(normalizedLine);
+}
+
+function hasSelectedMapPickLine(line) {
+  const normalizedLine = String(line || '');
+  return state.mapPickSelectedLines.map(String).includes(normalizedLine);
+}
+
 function renderDepartureLineButton() {
   const label = state.selectedDepartureLines.length
     ? state.selectedDepartureLines.join(', ')
@@ -2054,18 +2300,6 @@ function renderDepartureLineButton() {
 }
 
 function renderFavoritesList() {
-  if (!isAuthenticated()) {
-    return `
-      <div class="empty-state">
-        <p>${escapeHtml(t('noFavoritesPublic'))}</p>
-        <div class="stack-actions">
-          <button class="brutalist-btn" data-action="open-auth" data-mode="login" data-return="favorites">${escapeHtml(t('logIn'))}</button>
-          <button class="brutalist-btn outline" data-action="open-auth" data-mode="register" data-return="favorites">${escapeHtml(t('createAccount'))}</button>
-        </div>
-      </div>
-    `;
-  }
-
   if (!state.favorites.length) {
     return renderListMessage(state.favoritesMessage);
   }
@@ -2142,18 +2376,10 @@ function renderArrivals() {
     return renderListMessage(t('noDepartures60'));
   }
 
-  if (!state.selectedDepartureLines.length) {
-    return `
-      <div class="stack-gap">
-        ${renderDepartureLineButton()}
-        ${renderListMessage(t('selectLines'))}
-      </div>
-    `;
-  }
-
-  const filteredArrivals = upcomingArrivals.filter((arrival) =>
-    state.selectedDepartureLines.includes(String(arrival.line || t('unknown')))
-  );
+  const availableLines = getAvailableArrivalLines();
+  const filteredArrivals = state.selectedDepartureLines.length
+    ? upcomingArrivals.filter((arrival) => hasSelectedDepartureLine(arrival.line || t('unknown')))
+    : upcomingArrivals;
   const groups = new Map();
   filteredArrivals.forEach((arrival) => {
     const line = arrival.line || t('unknown');
@@ -2165,13 +2391,33 @@ function renderArrivals() {
 
   return `
     <div class="stack-gap">
-      ${renderDepartureLineButton()}
+      <div class="departure-filter-row" aria-label="${escapeHtml(t('chooseLines'))}">
+        <button
+          class="line-filter-chip line-filter-chip--all ${state.selectedDepartureLines.length ? '' : 'active'}"
+          type="button"
+          data-action="clear-departure-lines"
+          aria-pressed="${state.selectedDepartureLines.length ? 'false' : 'true'}"
+        >
+          ${escapeHtml(t('allLines'))}
+        </button>
+        ${availableLines.map((line) => `
+          <button
+            class="line-filter-chip ${hasSelectedDepartureLine(line) ? 'active' : ''}"
+            type="button"
+            data-action="toggle-departure-line"
+            data-line="${escapeHtml(line)}"
+            aria-pressed="${hasSelectedDepartureLine(line) ? 'true' : 'false'}"
+          >
+            ${escapeHtml(line)}
+          </button>
+        `).join('')}
+      </div>
       ${
         filteredArrivals.length
           ? Array.from(groups.entries())
               .sort(([leftLine], [rightLine]) => compareLineLabels(leftLine, rightLine))
               .map(([line, arrivals]) => `
-      <div class="route-card">
+      <div class="route-card ${state.selectedDepartureLines.length && hasSelectedDepartureLine(line) ? 'route-card--selected-line' : ''}">
         <div class="route-card__header">
           <div>
             <div class="route-card__line">${escapeHtml(t('line'))} ${escapeHtml(line)}</div>
@@ -2184,7 +2430,8 @@ function renderArrivals() {
             .map((arrival) => `
               <div class="arrival-row">
                 <span class="arrival-chip">${escapeHtml(arrival.mins_remaining)} min</span>
-                <span>${escapeHtml(arrival.arrival_time)}</span>
+                <span class="arrival-separator" aria-hidden="true"></span>
+                <span class="arrival-time">${escapeHtml(formatDisplayTime(arrival.arrival_time))}</span>
               </div>
             `)
             .join('')}
@@ -2279,6 +2526,7 @@ function renderNavigationResults() {
                       ? `${escapeHtml(route.direction || t('directionUnavailable'))} · ${escapeHtml(route.stops_count)} ${escapeHtml(t('stops'))}`
                       : `${escapeHtml(t('transferAt'))}: ${escapeHtml(route.transfer_at || '')}`}
                   </div>
+                  ${formatApproxRideTime(route) ? `<div class="route-card__eta">${escapeHtml(formatApproxRideTime(route))}</div>` : ''}
                   ${renderRouteStopsRow(route)}
                 </div>
                 <div class="route-card__actions">
@@ -2353,8 +2601,74 @@ function renderRecentLinesCarousel() {
   `;
 }
 
+function renderHomeSavedStops() {
+  if (!state.favorites.length) {
+    return `<div class="home-empty-row">${escapeHtml(t('noFavorites'))}</div>`;
+  }
+
+  return `
+    <div class="saved-stop-strip">
+      ${state.favorites.slice(0, 3).map((favorite) => {
+        const lines = parseLineList(favorite.presetLine || '').length
+          ? parseLineList(favorite.presetLine || '')
+          : (favorite.lines || []).slice(0, 3);
+        return `
+          <button class="saved-stop-card" data-action="open-stop" ${stopDataset(favorite)}>
+            <span class="saved-stop-card__top">
+              <span><i data-lucide="bus-front"></i>${escapeHtml(favorite.stationId)}</span>
+              <i data-lucide="star"></i>
+            </span>
+            <strong>${escapeHtml(favorite.favoriteName || favorite.name)}</strong>
+            <small>${escapeHtml(lines.join(', ') || t('stop'))}</small>
+          </button>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+function renderHomeRecentRows() {
+  if (!state.recentLines.length) {
+    return `<div class="home-empty-row">${escapeHtml(t('noRecentLines'))}</div>`;
+  }
+
+  return `
+    <div class="home-row-list">
+      ${state.recentLines.slice(0, 3).map((item, index) => `
+        <button class="home-row" data-action="open-recent-item" data-recent-index="${index}">
+          <span class="home-row__icon"><i data-lucide="bus-front"></i></span>
+          <span class="home-row__main">${escapeHtml(item.type === 'stop' ? `${item.name || t('stop')} (${item.stationId})` : item.line)}</span>
+          <span class="home-row__meta">${escapeHtml(item.type === 'stop' ? item.presetLine : t('line'))}</span>
+          <i data-lucide="arrow-right"></i>
+        </button>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderHomeNearbyRows() {
+  if (!state.nearbyStops.length) {
+    return `<div class="home-empty-row">${escapeHtml(state.nearbyMessage)}</div>`;
+  }
+
+  return `
+    <div class="home-row-list">
+      ${state.nearbyStops.slice(0, 3).map((stop) => `
+        <button class="home-row home-row--nearby" data-action="open-stop" ${stopDataset(stop)}>
+          <span class="home-row__walk"><i data-lucide="map-pin"></i></span>
+          <span class="home-row__main">${escapeHtml(`${stop.name} (${stop.stationId})`)}</span>
+          <span class="home-row__meta">${escapeHtml(stop.distance != null ? `${Math.round(stop.distance)} m` : '')}</span>
+          <span class="home-row__lines">
+            ${(stop.lines || []).slice(0, 5).map((line) => `<strong>${escapeHtml(line)}</strong>`).join('')}
+          </span>
+        </button>
+      `).join('')}
+    </div>
+  `;
+}
+
 function renderTopFavoritesCarousel() {
-  if (!isAuthenticated() || !state.favorites.length) {
+  if (!state.favorites.length) {
     return '';
   }
 
@@ -2400,9 +2714,6 @@ function renderSheetContent() {
     if (!lines.length) {
       return renderListMessage(t('noDepartures60'));
     }
-    const selected = lines.filter((line) => state.selectedDepartureLines.includes(line));
-    const unselected = lines.filter((line) => !state.selectedDepartureLines.includes(line));
-    const orderedLines = [...selected, ...unselected];
 
     return `
       <div class="sheet-controls">
@@ -2410,13 +2721,13 @@ function renderSheetContent() {
         <button class="ghost-action compact-action" type="button" data-action="clear-departure-lines">${escapeHtml(t('clearRecent'))}</button>
       </div>
       <div class="line-filter-bar sheet-line-list">
-        ${orderedLines
+        ${lines
           .map((line) => `
             <button
-              class="line-filter-chip ${state.selectedDepartureLines.includes(line) ? 'active' : ''}"
+              class="line-filter-chip ${hasSelectedDepartureLine(line) ? 'active' : ''}"
               data-action="toggle-departure-line"
               data-line="${escapeHtml(line)}"
-              aria-pressed="${state.selectedDepartureLines.includes(line) ? 'true' : 'false'}"
+              aria-pressed="${hasSelectedDepartureLine(line) ? 'true' : 'false'}"
             >
               ${escapeHtml(line)}
             </button>
@@ -2454,6 +2765,23 @@ function renderActiveSheet() {
         <div class="sheet-body">
           ${renderSheetContent()}
         </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderExpandedMap() {
+  if (!state.mapExpanded) {
+    return '';
+  }
+
+  return `
+    <section class="expanded-map-backdrop">
+      <div class="expanded-map-shell" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('mapCaption'))}" tabindex="-1">
+        <button class="dialog-close-btn expanded-map-close" type="button" data-action="close-expanded-map" aria-label="${escapeHtml(t('close'))}">
+          <i data-lucide="x"></i>
+        </button>
+        <div id="map-expanded-anchor" class="expanded-map-anchor"></div>
       </div>
     </section>
   `;
@@ -2510,6 +2838,9 @@ function renderStopChoiceDialog() {
     return `
       <section class="choice-dialog-backdrop" data-action="close-dialog">
         <div class="choice-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('chooseNearbyStop'))}" tabindex="-1" data-dialog-panel>
+          <button class="dialog-close-btn" type="button" data-action="close-dialog" aria-label="${escapeHtml(t('close'))}">
+            <i data-lucide="x"></i>
+          </button>
           <div>
             <div class="hero-block__eyebrow">${escapeHtml(t('pickedMapPoint'))}</div>
             <h2>${escapeHtml(t('chooseNearbyStop'))}</h2>
@@ -2526,9 +2857,6 @@ function renderStopChoiceDialog() {
               </button>
             `).join('') : `<p class="settings-hint">${escapeHtml(t('noStopsArea'))}</p>`}
           </div>
-          <div class="stack-actions">
-            <button class="ghost-action" data-action="choose-different-stop">${escapeHtml(t('chooseDifferent'))}</button>
-          </div>
         </div>
       </section>
     `;
@@ -2540,9 +2868,15 @@ function renderStopChoiceDialog() {
 
   const stop = state.mapPickCandidate;
   const lines = stop.lines || [];
+  const selectedLineLabel = state.mapPickSelectedLines.length
+    ? `${escapeHtml(t('presetLine'))} ${escapeHtml(state.mapPickSelectedLines.join(', '))}`
+    : escapeHtml(t('chooseLines'));
   return `
     <section class="choice-dialog-backdrop" data-action="close-dialog">
       <div class="choice-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('selectedStop'))}" tabindex="-1" data-dialog-panel>
+        <button class="dialog-close-btn" type="button" data-action="close-dialog" aria-label="${escapeHtml(t('close'))}">
+          <i data-lucide="x"></i>
+        </button>
         <div>
           <div class="hero-block__eyebrow">${escapeHtml(t('selectedStop'))}</div>
           <h2>${escapeHtml(stop.name)}</h2>
@@ -2552,12 +2886,22 @@ function renderStopChoiceDialog() {
           <strong>${escapeHtml(t('registeredLines'))}</strong>
           ${
             lines.length
-              ? `<div class="line-filter-bar">${lines.slice(0, 18).map((line) => `<span class="line-filter-chip">${escapeHtml(line)}</span>`).join('')}</div>`
+              ? `<div class="line-filter-bar">${lines.slice(0, 18).map((line) => `
+                  <button
+                    class="line-filter-chip ${hasSelectedMapPickLine(line) ? 'active' : ''}"
+                    type="button"
+                    data-action="toggle-map-pick-line"
+                    data-line="${escapeHtml(line)}"
+                    aria-pressed="${hasSelectedMapPickLine(line) ? 'true' : 'false'}"
+                  >
+                    ${escapeHtml(line)}
+                  </button>
+                `).join('')}</div>`
               : `<p class="settings-hint">${escapeHtml(t('noRegisteredLines'))}</p>`
           }
+          <p class="settings-hint">${selectedLineLabel}</p>
         </div>
         <div class="stack-actions">
-          <button class="ghost-action" data-action="choose-different-stop">${escapeHtml(t('chooseDifferent'))}</button>
           <button class="brutalist-btn" data-action="confirm-picked-stop">${escapeHtml(t('proceed'))}</button>
         </div>
       </div>
@@ -2567,52 +2911,60 @@ function renderStopChoiceDialog() {
 
 function renderHomeView() {
   return `
-    <section class="home-hero">
-      <div class="home-hero__copy">
-        <span class="hero-block__eyebrow">${escapeHtml(t('serviceStatus'))}</span>
+    <section class="departures-hero">
+      <div class="departures-hero__copy">
         <h1 class="home-title">${escapeHtml(t('homeTitle'))}</h1>
-        <p class="panel-copy">${escapeHtml(t('homeIntro'))}</p>
       </div>
-      <form id="home-search-form" class="home-search-card">
-        ${renderField({ id: 'home-search-input', label: t('homeSearchPlaceholder'), icon: 'search', value: state.searchQuery })}
+      <form id="home-search-form" class="departures-search-card">
+        <label class="search-box departures-search-box" for="home-search-input">
+          <i data-lucide="search"></i>
+          <input id="home-search-input" type="text" value="${escapeHtml(state.searchQuery)}" placeholder="${escapeHtml(t('homeSearchPlaceholder'))}">
+          <button class="input-help-btn" type="button" data-action="toggle-search-help" aria-label="${escapeHtml(t('searchHelp'))}" aria-expanded="${state.searchHelpOpen ? 'true' : 'false'}">?</button>
+        </label>
+        ${state.searchHelpOpen ? renderSearchHelp() : ''}
         <button class="brutalist-btn search-submit" type="submit"><i data-lucide="search"></i>${escapeHtml(t('searchButton'))}</button>
       </form>
+      <div class="quick-action-grid">
+        <button class="brutalist-btn outline" type="button" data-action="locate-nearby">
+          <i data-lucide="locate-fixed"></i>${escapeHtml(t('useLocation'))}
+        </button>
+        <button class="brutalist-btn outline" type="button" data-action="expand-map">
+          <i data-lucide="map-pin"></i>${escapeHtml(t('openMap'))}
+        </button>
+      </div>
     </section>
 
-    ${state.mapPickMode ? `
-      <section class="home-map-actions">
-        <p class="settings-hint">${escapeHtml(t('pickMapHint'))}</p>
+    ${state.searchResultsExpanded || state.searchMessage !== t('searchInitial') ? `
+      <section class="panel-block">
+        <div class="section-heading">
+          <div class="section-label">${escapeHtml(t('searchResultsTitle'))}</div>
+        </div>
+        <div class="stop-list nearby-preview">${renderStopList(state.searchResults, state.searchMessage)}</div>
       </section>
     ` : ''}
 
-    <section class="map-stage home-map-stage" aria-label="${escapeHtml(t('mapCaption'))}">
-      <div class="map-stage__label">
-        <span>${escapeHtml(t('mapCaption'))}</span>
-        <strong>${escapeHtml(state.nearbyCenterLabel || t('belgradeCenter'))}</strong>
+    <section class="panel-block">
+      <div class="section-heading">
+        <div class="section-label">${escapeHtml(t('savedStops'))}</div>
       </div>
-    <div id="map-anchor" class="inline-map-anchor"></div>
-    </section>
-
-    <section class="home-map-actions home-map-actions--below-map">
-      <div class="stack-actions">
-        <button class="brutalist-btn outline" type="button" data-action="locate-nearby"><i data-lucide="locate-fixed"></i>${escapeHtml(t('useLocation'))}</button>
-        <button class="brutalist-btn outline" type="button" data-action="start-map-pick"><i data-lucide="map-pin"></i>${escapeHtml(t('chooseOnMap'))}</button>
-      </div>
+      ${renderHomeSavedStops()}
     </section>
 
     <section class="panel-block">
-      <button class="nearby-toggle" data-action="toggle-nearby" aria-expanded="${state.nearbyExpanded ? 'true' : 'false'}">
-        <span class="nearby-toggle__label">${escapeHtml(t('nearbyStops'))}</span>
-        <i class="nearby-toggle__icon" data-lucide="chevron-${state.nearbyExpanded ? 'up' : 'down'}"></i>
-      </button>
-      ${
-        state.nearbyExpanded
-          ? `<div class="stop-list nearby-preview">${renderStopList(state.nearbyStops.slice(0, 3), state.nearbyMessage)}</div>`
-          : ''
-      }
+      <div class="section-heading">
+        <div class="section-label">${escapeHtml(t('recentLines'))}</div>
+        ${state.recentLines.length ? `<button class="ghost-action compact-action" data-action="clear-recent-lines">${escapeHtml(t('clearRecent'))}</button>` : ''}
+      </div>
+      ${renderHomeRecentRows()}
     </section>
 
-    ${renderTopFavoritesCarousel()}
+    <section class="panel-block">
+      <div class="section-heading">
+        <div class="section-label">${escapeHtml(t('nearbyStops'))}</div>
+        <button class="ghost-action compact-action" data-action="refresh-nearby">${escapeHtml(t('refresh'))}</button>
+      </div>
+      ${renderHomeNearbyRows()}
+    </section>
   `;
 }
 
@@ -2622,8 +2974,8 @@ function renderSearchView() {
     <section class="search-wrap stack-gap">
       <form id="search-form" class="stack-gap">
         ${renderField({ id: 'search-input', label: t('searchPlaceholder'), icon: 'search', value: state.searchQuery })}
+        <button class="brutalist-btn outline" type="button" data-action="locate-nearby"><i data-lucide="locate-fixed"></i>${escapeHtml(t('useLocation'))}</button>
         <button class="brutalist-btn search-submit" type="submit"><i data-lucide="search"></i>${escapeHtml(t('search'))}</button>
-        <button class="brutalist-btn outline" type="button" data-action="start-map-pick"><i data-lucide="map-pin"></i>${escapeHtml(t('chooseOnMap'))}</button>
       </form>
     </section>
     <section class="panel-block">
@@ -2637,7 +2989,16 @@ function renderSearchView() {
           : ''
       }
     </section>
-    <div id="map-anchor" class="inline-map-anchor"></div>
+    <section class="map-stage nav-map-stage" aria-label="${escapeHtml(t('mapCaption'))}">
+      <div class="map-stage__label">
+        <span>${escapeHtml(t('mapCaption'))}</span>
+        <strong>${escapeHtml(state.nearbyCenterLabel || t('searchStops'))}</strong>
+      </div>
+      <button class="map-expand-btn" type="button" data-action="expand-map" aria-label="${escapeHtml(t('showOnMap'))}">
+        <i data-lucide="maximize-2"></i>
+      </button>
+      <div id="map-anchor" class="inline-map-anchor"></div>
+    </section>
   `;
 }
 
@@ -2705,7 +3066,16 @@ function renderNavigateView() {
       ` : ''}
       ${renderNavigationResults()}
     </section>
-    <div id="map-anchor" class="inline-map-anchor"></div>
+    <section class="map-stage nav-map-stage" aria-label="${escapeHtml(t('mapCaption'))}">
+      <div class="map-stage__label">
+        <span>${escapeHtml(t('mapCaption'))}</span>
+        <strong>${escapeHtml(state.navFromLocation ? t('currentLocationStart') : t('navigate'))}</strong>
+      </div>
+      <button class="map-expand-btn" type="button" data-action="expand-map" aria-label="${escapeHtml(t('showOnMap'))}">
+        <i data-lucide="maximize-2"></i>
+      </button>
+      <div id="map-anchor" class="inline-map-anchor"></div>
+    </section>
   `;
 }
 
@@ -2832,45 +3202,32 @@ function renderStopView() {
   }
 
   const favorite = getFavoriteForStop(state.currentStop);
-  const favoriteAction = isAuthenticated()
-    ? favorite
-      ? `<button class="ghost-action" data-action="delete-favorite" data-favorite-name="${escapeHtml(favorite.favoriteName)}">${escapeHtml(t('removeFavorite'))}</button>`
-      : `
-        <form id="favorite-form" class="favorite-form">
-          <label class="inline-field" for="favorite-name-input">
-            <span>${escapeHtml(t('favoriteLabel'))}</span>
-            <input class="inline-input" id="favorite-name-input" type="text" placeholder="${escapeHtml(t('favoriteLabel'))}" value="${escapeHtml(state.currentStop.name)}">
-          </label>
-          <label class="inline-field" for="favorite-line-input">
-            <span>${escapeHtml(t('optionalLine'))}</span>
-            <input class="inline-input" id="favorite-line-input" type="text" placeholder="${escapeHtml(t('optionalLine'))}" value="${escapeHtml(state.selectedDepartureLines.join(', '))}">
-          </label>
-          <button class="favorite-save-btn" type="submit" aria-label="${escapeHtml(t('saveFavorite'))}" title="${escapeHtml(t('saveFavorite'))}">
-            <i data-lucide="star"></i>
-            <span>${escapeHtml(t('savePreset'))}</span>
-          </button>
-        </form>
-      `
-    : `<button class="ghost-action" data-action="open-auth" data-mode="login" data-return="stop">${escapeHtml(t('loginToSave'))}</button>`;
+  const favoriteAction = favorite
+    ? `<button class="ghost-action" data-action="delete-favorite" data-favorite-name="${escapeHtml(favorite.favoriteName)}">${escapeHtml(t('removeFavorite'))}</button>`
+    : `<button class="favorite-save-btn stop-save-btn" type="button" data-action="save-current-stop"><i data-lucide="star"></i><span>${escapeHtml(t('saveFavorite'))}</span></button>`;
 
   return `
     <section class="stop-shell">
-      <button class="back-link" data-action="go-back">
-        <i data-lucide="arrow-left"></i>
-        <span>${escapeHtml(t('back'))}</span>
-      </button>
       <div class="stop-hero">
+        <button class="back-link" data-action="go-back" aria-label="${escapeHtml(t('back'))}">
+          <i data-lucide="arrow-left"></i>
+        </button>
         <div class="stop-hero__eyebrow">${escapeHtml(t('stop'))} ${escapeHtml(state.currentStop.stationId)}</div>
         <h1>${escapeHtml(state.currentStop.name)}</h1>
-        <div class="stack-actions">${favoriteAction}</div>
       </div>
 
       <section class="panel-block">
         <div class="panel-block__header">
           <div class="section-label">${escapeHtml(t('upcomingDepartures'))}</div>
-          <button class="ghost-action" data-action="reload-stop">${escapeHtml(t('refresh'))}</button>
+          <div class="panel-actions">
+            <button class="ghost-action compact-action" type="button" data-action="reload-stop">${escapeHtml(t('refresh'))}</button>
+          </div>
         </div>
         ${renderArrivals()}
+      </section>
+
+      <section class="stop-secondary-actions">
+        ${favoriteAction}
       </section>
 
       <section class="panel-block">
@@ -2884,6 +3241,9 @@ function renderStopView() {
               <span>${escapeHtml(t('lineRoute'))}</span>
               <strong>${escapeHtml(state.routeLine || t('line'))}</strong>
             </div>
+            <button class="map-expand-btn" type="button" data-action="expand-map" aria-label="${escapeHtml(t('showOnMap'))}">
+              <i data-lucide="maximize-2"></i>
+            </button>
             <div id="map-anchor" class="inline-map-anchor"></div>
           </section>
         ` : ''}
@@ -2927,6 +3287,12 @@ function getFocusableElements(container) {
 }
 
 function closeTopOverlay() {
+  if (state.mapExpanded) {
+    state.mapExpanded = false;
+    renderView(state.currentView);
+    return true;
+  }
+
   if (state.activeSheet) {
     state.activeSheet = '';
     renderView(state.currentView);
@@ -2936,8 +3302,10 @@ function closeTopOverlay() {
   if (state.favoriteChoiceStop || state.mapPickCandidate || state.mapPickOptions.length || state.mapPickMessage) {
     state.favoriteChoiceStop = null;
     state.mapPickCandidate = null;
+    state.mapPickSelectedLines = [];
     state.mapPickOptions = [];
     state.mapPickMessage = '';
+    mapPickRequestId += 1;
     renderView(state.currentView);
     return true;
   }
@@ -2986,7 +3354,7 @@ function renderView(viewName) {
   }
 
   state.currentView = viewName;
-  contentArea.innerHTML = `${renderCurrentView()}${renderActiveSheet()}${renderStopChoiceDialog()}`;
+  contentArea.innerHTML = `${renderCurrentView()}${renderActiveSheet()}${renderStopChoiceDialog()}${renderExpandedMap()}`;
   afterRenderBindings();
 
   if (focusState && state.currentView === 'navigate') {
@@ -3015,8 +3383,8 @@ function openAuth(mode, returnView = 'profile') {
 
 async function loadFavorites() {
   if (!isAuthenticated()) {
-    state.favorites = [];
-    state.favoritesMessage = t('favoritesRequireLogin');
+    state.favorites = loadLocalFavorites();
+    state.favoritesMessage = state.favorites.length ? '' : t('noFavorites');
     if (state.currentView === 'favorites') {
       renderView('favorites');
     }
@@ -3045,8 +3413,20 @@ async function loadFavorites() {
 }
 
 async function findNearbyStops(options = {}) {
-  const { useBrowserLocation = false, coords: providedCoords = null, label: providedLabel = '', openSheet = false, droppedPin = false } = options;
+  const {
+    useBrowserLocation = false,
+    coords: providedCoords = null,
+    label: providedLabel = '',
+    openSheet = false,
+    droppedPin = false,
+    showInSearch = false
+  } = options;
   state.nearbyMessage = t('loadingNearby');
+  if (showInSearch && state.currentView === 'search') {
+    state.searchMessage = t('loadingNearby');
+    state.searchResultsExpanded = true;
+    renderView('search');
+  }
   if (state.currentView === 'home') {
     renderView('home');
   }
@@ -3076,14 +3456,12 @@ async function findNearbyStops(options = {}) {
     const data = await apiRequest(`/stops/nearby?lat=${coords.lat}&lon=${coords.lon}&radius=650`);
     state.nearbyStops = (data.stops || []).map(normalizeStop);
     state.nearbyCenterLabel = label;
-    if (droppedPin && state.currentView === 'search') {
+    if ((droppedPin || showInSearch) && state.currentView === 'search') {
       state.searchResults = state.nearbyStops;
       state.searchMessage = state.searchResults.length
         ? `${state.searchResults.length} ${state.searchResults.length === 1 ? t('resultFound') : t('resultsFound')}`
         : t('noStopsArea');
-    }
-    if (droppedPin) {
-      renderDroppedPin(coords);
+      state.searchResultsExpanded = true;
     }
     if (!state.nearbyStops.length) {
       state.nearbyMessage = t('noStopsArea');
@@ -3099,38 +3477,84 @@ async function findNearbyStops(options = {}) {
 
   if (state.currentView === 'home') {
     renderView('home');
+  } else if (showInSearch && state.currentView === 'search') {
+    renderView('search');
   } else if (openSheet) {
     renderView(state.currentView);
   }
 }
 
+function parseFastDepartureQuery(query) {
+  const value = String(query || '').trim();
+  if (!value) {
+    return null;
+  }
+
+  const lineAndStopMatch = value.match(/^([A-Za-z]?\d+[A-Za-z]?)\s+(\d{1,5})$/);
+  if (lineAndStopMatch) {
+    return {
+      line: lineAndStopMatch[1].toUpperCase(),
+      stationId: lineAndStopMatch[2]
+    };
+  }
+
+  if (/^\d{1,5}$/.test(value)) {
+    return {
+      line: '',
+      stationId: value
+    };
+  }
+
+  return null;
+}
+
 async function searchStops(query) {
+  const requestId = ++searchRequestId;
   state.searchQuery = query.trim();
   state.searchResults = [];
   state.searchResultsExpanded = false;
   state.searchResolvedAddress = '';
   state.searchMessage = state.searchQuery ? t('searchingStops') : t('enterStop');
-  renderView('search');
+  renderView(state.currentView === 'home' ? 'home' : 'search');
 
   if (!state.searchQuery) {
     return;
   }
 
+  const fastDeparture = parseFastDepartureQuery(state.searchQuery);
+  if (fastDeparture) {
+    await openStop({
+      station_id: fastDeparture.stationId,
+      stop_id: fastDeparture.stationId,
+      name: `${t('stop')} ${fastDeparture.stationId}`,
+      presetLine: fastDeparture.line
+    });
+    return;
+  }
+
   try {
     const data = await resolveSearchStops(state.searchQuery, 8);
+    if (requestId !== searchRequestId) {
+      return;
+    }
     state.searchResults = data.stops;
     state.searchResolvedAddress = data.resolvedAddress || '';
     state.searchMessage = state.searchResults.length
       ? `${state.searchResults.length} ${state.searchResults.length === 1 ? t('resultFound') : t('resultsFound')}`
       : t('noStopMatches');
-    state.searchResultsExpanded = false;
+    state.searchResultsExpanded = true;
   } catch (error) {
+    if (requestId !== searchRequestId) {
+      return;
+    }
     state.searchResults = [];
-    state.searchResultsExpanded = false;
+    state.searchResultsExpanded = true;
     state.searchMessage = error.message === 'Address was not found' ? t('addressNotFound') : error.message;
   }
 
-  renderView('search');
+  if (state.currentView === 'home' || state.currentView === 'search') {
+    renderView(state.currentView);
+  }
 }
 
 async function resolveStopForNavigation(query, options = {}) {
@@ -4445,10 +4869,12 @@ async function loadStopArrivals() {
   renderView('stop');
 
   try {
-    const lineParam = state.selectedDepartureLines.length
-      ? `&lines=${encodeURIComponent(state.selectedDepartureLines.join(','))}`
-      : '';
-    const data = await apiRequest(`/predict/stop?station_id=${encodeURIComponent(requestedStopId)}${lineParam}`);
+    const params = new URLSearchParams({ station_id: requestedStopId });
+    if (state.selectedDepartureLines.length) {
+      params.set('lines', state.selectedDepartureLines.join(','));
+    }
+
+    const data = await apiRequest(`/predict/stop?${params.toString()}`);
     state.arrivals = data.predicted_arrivals || [];
     if (state.selectedDepartureLines.length) {
       addRecentStop({
@@ -4546,6 +4972,20 @@ async function saveCurrentStopToFavorites(name, line = '') {
     return;
   }
 
+  if (!isAuthenticated()) {
+    state.favorites = upsertLocalFavorite({
+      ...state.currentStop,
+      favoriteName,
+      presetLine
+    });
+    state.favoritesMessage = state.favorites.length ? '' : t('noFavorites');
+    if (presetLine) {
+      parseLineList(presetLine).forEach(addRecentLine);
+    }
+    renderView('stop');
+    return;
+  }
+
   try {
     await apiRequest('/favorites', {
       method: 'POST',
@@ -4573,14 +5013,22 @@ async function saveNavigationRouteToFavorites(route) {
     return;
   }
 
-  if (!isAuthenticated()) {
-    openAuth('login', 'navigate');
-    return;
-  }
-
   const payload = getRouteFavoritePayload(route);
   if (!payload.station_id || !payload.name) {
     state.navMessage = t('stopMissing');
+    renderView('navigate');
+    return;
+  }
+
+  if (!isAuthenticated()) {
+    state.favorites = upsertLocalFavorite({
+      station_id: payload.station_id,
+      name: payload.name,
+      favoriteName: payload.name,
+      presetLine: payload.line || ''
+    });
+    parseLineList(payload.line || '').forEach(addRecentLine);
+    state.navMessage = t('routeSaved');
     renderView('navigate');
     return;
   }
@@ -4604,6 +5052,15 @@ async function saveNavigationRouteToFavorites(route) {
 }
 
 async function deleteFavorite(name) {
+  if (!isAuthenticated()) {
+    state.favorites = removeLocalFavorite(name);
+    state.favoritesMessage = state.favorites.length ? '' : t('noFavorites');
+    if (state.currentView === 'favorites' || state.currentView === 'stop') {
+      renderView(state.currentView);
+    }
+    return;
+  }
+
   try {
     await apiRequest(`/favorites/${encodeURIComponent(name)}`, {
       method: 'DELETE',
@@ -4620,6 +5077,20 @@ async function deleteFavorite(name) {
 
 async function updateFavorite(oldName, values) {
   state.favoriteEditMessage = '';
+
+  if (!isAuthenticated()) {
+    const nextFavorites = removeLocalFavorite(oldName);
+    saveLocalFavorites(nextFavorites);
+    state.favorites = upsertLocalFavorite({
+      station_id: values.station_id,
+      name: values.name,
+      favoriteName: values.name,
+      presetLine: values.line || ''
+    });
+    state.editingFavoriteName = '';
+    renderView('favorites');
+    return;
+  }
 
   try {
     await apiRequest(`/favorites/${encodeURIComponent(oldName)}`, {
@@ -4798,6 +5269,23 @@ function wireNavigation() {
       return;
     }
 
+    if (action === 'expand-map') {
+      if (state.currentView === 'home' && !state.nearbyStops.length) {
+        await findNearbyStops();
+      }
+      state.mapExpanded = true;
+      renderView(state.currentView);
+      setTimeout(() => map?.invalidateSize(), 0);
+      return;
+    }
+
+    if (action === 'close-expanded-map') {
+      state.mapExpanded = false;
+      renderView(state.currentView);
+      setTimeout(() => map?.invalidateSize(), 0);
+      return;
+    }
+
     if (action === 'close-favorite-choice') {
       state.favoriteChoiceStop = null;
       renderView(state.currentView);
@@ -4828,7 +5316,23 @@ function wireNavigation() {
     }
 
     if (action === 'locate-nearby') {
-      await findNearbyStops({ useBrowserLocation: true });
+      await findNearbyStops({
+        useBrowserLocation: true,
+        showInSearch: state.currentView === 'search'
+      });
+      return;
+    }
+
+    if (action === 'focus-departure-search') {
+      const input = document.getElementById('home-search-input');
+      input?.focus();
+      input?.select();
+      return;
+    }
+
+    if (action === 'toggle-search-help') {
+      state.searchHelpOpen = !state.searchHelpOpen;
+      renderView('home');
       return;
     }
 
@@ -4837,26 +5341,13 @@ function wireNavigation() {
       return;
     }
 
-    if (action === 'start-map-pick') {
-      state.mapPickMode = true;
-      state.mapPickCandidate = null;
-      state.mapPickOptions = [];
-      state.mapPickMessage = '';
-      state.favoriteChoiceStop = null;
-      state.activeSheet = '';
-      renderView(state.currentView);
-      if (map) {
-        setTimeout(() => map.invalidateSize(), 0);
-      }
-      return;
-    }
-
     if (action === 'choose-different-stop') {
+      mapPickRequestId += 1;
       state.mapPickCandidate = null;
+      state.mapPickSelectedLines = [];
       state.mapPickOptions = [];
       state.mapPickMessage = '';
       state.favoriteChoiceStop = null;
-      state.mapPickMode = true;
       renderView(state.currentView);
       return;
     }
@@ -4864,19 +5355,35 @@ function wireNavigation() {
     if (action === 'select-map-pick-stop') {
       const stop = state.mapPickOptions[Number(actionTarget.dataset.stopIndex)];
       if (stop) {
+        state.mapPickSelectedLines = [];
         await showStopChoice(stop);
       }
       return;
     }
 
+    if (action === 'toggle-map-pick-line') {
+      const line = actionTarget.dataset.line || '';
+      if (hasSelectedMapPickLine(line)) {
+        state.mapPickSelectedLines = state.mapPickSelectedLines.filter((value) => String(value) !== String(line));
+      } else {
+        state.mapPickSelectedLines = [...state.mapPickSelectedLines, line].sort(compareLineLabels);
+      }
+      renderView(state.currentView);
+      return;
+    }
+
     if (action === 'confirm-picked-stop') {
+      mapPickRequestId += 1;
       const stop = state.mapPickCandidate;
       state.mapPickCandidate = null;
       state.mapPickOptions = [];
       state.mapPickMessage = '';
-      state.mapPickMode = false;
       if (stop) {
-        await openStop(stop);
+        await openStop({
+          ...stop,
+          presetLine: state.mapPickSelectedLines.join(', ')
+        });
+        state.mapPickSelectedLines = [];
       } else {
         renderView(state.currentView);
       }
@@ -5026,26 +5533,31 @@ function wireNavigation() {
       return;
     }
 
+    if (action === 'save-current-stop') {
+      await saveCurrentStopToFavorites(state.currentStop?.name || '', state.selectedDepartureLines.join(', '));
+      return;
+    }
+
     if (action === 'toggle-departure-line') {
       const line = actionTarget.dataset.line || '';
-      if (state.selectedDepartureLines.includes(line)) {
-        state.selectedDepartureLines = state.selectedDepartureLines.filter((value) => value !== line);
+      if (hasSelectedDepartureLine(line)) {
+        state.selectedDepartureLines = state.selectedDepartureLines.filter((value) => String(value) !== String(line));
       } else {
         state.selectedDepartureLines = [...state.selectedDepartureLines, line].sort(compareLineLabels);
       }
-      renderView('stop');
+      await loadStopArrivals();
       return;
     }
 
     if (action === 'select-all-departure-lines') {
       state.selectedDepartureLines = getAvailableArrivalLines();
-      renderView('stop');
+      await loadStopArrivals();
       return;
     }
 
     if (action === 'clear-departure-lines') {
       state.selectedDepartureLines = [];
-      renderView('stop');
+      await loadStopArrivals();
       return;
     }
 
@@ -5244,7 +5756,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   setLanguage(state.language);
   state.recentLines = loadRecentLines();
   state.favoriteUsage = loadFavoriteUsage();
+  state.favorites = isAuthenticated() ? [] : loadLocalFavorites();
+  state.favoritesMessage = state.favorites.length ? '' : t('noFavorites');
   resetLocalizedMessages();
+  state.favoritesMessage = state.favorites.length ? '' : t('noFavorites');
   ensureMap();
   wireNavigation();
   renderView('home');
