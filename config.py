@@ -31,7 +31,7 @@ def _env_float(name: str, default: float, minimum: float) -> float:
 
 APP_ENV = os.getenv("APP_ENV", "local").strip().lower()
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
-API_PORT = int(os.getenv("API_PORT", "5000"))
+API_PORT = _env_int("API_PORT", 5000, 1)
 IS_LOCAL_DEV = APP_ENV in {"local", "dev", "development", "test"} and _is_loopback_host(API_HOST)
 
 DATA_DIR = os.getenv("DATA_DIR", "").strip()
@@ -48,6 +48,11 @@ def _data_path(env_name: str, default_name: str) -> str:
     return default_name
 
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+PLACEHOLDER_JWT_SECRETS = {
+    "your_jwt_secret_here",
+    "replace-with-a-long-random-secret",
+    "<long-random-secret>",
+}
 
 if not JWT_SECRET:
     if not IS_LOCAL_DEV:
@@ -60,6 +65,11 @@ if not JWT_SECRET:
         "JWT tokens will NOT persist across restarts."
     )
     JWT_SECRET = secrets.token_hex(32)
+elif not IS_LOCAL_DEV and (JWT_SECRET in PLACEHOLDER_JWT_SECRETS or len(JWT_SECRET) < 32):
+    raise RuntimeError(
+        "JWT_SECRET must be a non-placeholder secret of at least 32 characters "
+        "outside local loopback development."
+    )
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -67,13 +77,13 @@ ALLOWED_ORIGINS = os.getenv(
 ).split(",")
 RATE_LIMIT_STORAGE_URI = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://").strip() or "memory://"
 TRUST_PROXY = _env_bool("TRUST_PROXY", False)
-GTFS_UPDATE_INTERVAL_DAYS = max(1, int(os.getenv("GTFS_UPDATE_INTERVAL_DAYS", "7")))
-GTFS_UPDATE_HOUR = max(0, min(23, int(os.getenv("GTFS_UPDATE_HOUR", "3"))))
-GTFS_UPDATE_MINUTE = max(0, min(59, int(os.getenv("GTFS_UPDATE_MINUTE", "0"))))
+GTFS_UPDATE_INTERVAL_DAYS = _env_int("GTFS_UPDATE_INTERVAL_DAYS", 7, 1)
+GTFS_UPDATE_HOUR = min(23, _env_int("GTFS_UPDATE_HOUR", 3, 0))
+GTFS_UPDATE_MINUTE = min(59, _env_int("GTFS_UPDATE_MINUTE", 0, 0))
 BGPREVOZ_UPDATE_ENABLED = _env_bool("BGPREVOZ_UPDATE_ENABLED", True)
 BGPREVOZ_UPDATE_INTERVAL_DAYS = _env_int("BGPREVOZ_UPDATE_INTERVAL_DAYS", 1, 1)
-BGPREVOZ_UPDATE_HOUR = max(0, min(23, int(os.getenv("BGPREVOZ_UPDATE_HOUR", "4"))))
-BGPREVOZ_UPDATE_MINUTE = max(0, min(59, int(os.getenv("BGPREVOZ_UPDATE_MINUTE", "30"))))
+BGPREVOZ_UPDATE_HOUR = min(23, _env_int("BGPREVOZ_UPDATE_HOUR", 4, 0))
+BGPREVOZ_UPDATE_MINUTE = min(59, _env_int("BGPREVOZ_UPDATE_MINUTE", 30, 0))
 BGPREVOZ_IMPORT_DELAY_SECONDS = _env_float("BGPREVOZ_IMPORT_DELAY_SECONDS", 0.2, 0.0)
 APP_DATA_DB = _data_path("APP_DATA_DB", "app_data.db")
 GTFS_DATASET_PAGE_URL = os.getenv(

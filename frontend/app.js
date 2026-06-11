@@ -153,7 +153,7 @@ function loadRecentLines() {
       return [];
     }
 
-    return parsed.slice(0, 5).map((item) => {
+    const normalizedItems = parsed.map((item) => {
       if (typeof item === 'string') {
         return { type: 'line', line: item };
       }
@@ -169,6 +169,14 @@ function loadRecentLines() {
         presetLine: item.presetLine || item.line || ''
       };
     });
+    const stopPresetLines = new Set(normalizedItems
+      .filter((item) => item.type === 'stop')
+      .flatMap((item) => parseLineList(item.presetLine || ''))
+      .map((line) => line.toLowerCase()));
+
+    return normalizedItems
+      .filter((item) => !(item.type === 'line' && stopPresetLines.has(String(item.line || '').toLowerCase())))
+      .slice(0, 5);
   } catch (error) {
     return [];
   }
@@ -306,7 +314,7 @@ function addRecentStop(stop) {
       item.type === 'stop'
       && item.stationId === recentStop.stationId
       && normalizeLineList(item.presetLine || '') === presetLine
-    ))
+    ) && !(item.type === 'line' && parseLineList(presetLine).map((line) => line.toLowerCase()).includes(String(item.line || '').toLowerCase())))
   ].slice(0, 5);
   localStorage.setItem('recentLines', JSON.stringify(state.recentLines));
 }
@@ -495,11 +503,14 @@ const translations = {
     loginToSave: 'Sacuvaj stanicu',
     upcomingDepartures: 'Sledeci polasci',
     lineRoute: 'Trasa linije',
+    stopLocation: 'Lokacija stajalista',
     noLineSelected: 'Nije izabrana linija',
     showRoute: 'Trasa',
     line: 'Linija',
     noDepartures60: 'Nema zakazanih polazaka u narednih 60 minuta.',
     selectLines: 'Dodirnite liniju ako zelite da suzite prikaz.',
+    chooseLinesPrompt: 'Izaberite jednu ili vise linija za prikaz polazaka.',
+    clearSelection: 'Ocisti',
     noSelectedDepartures: 'Nema polazaka za izabrane linije u narednih 60 minuta.',
     directionUnavailable: 'Smer nije dostupan',
     noFavoritesPublic: 'Sacuvane stanice ce se pojaviti ovde.',
@@ -669,11 +680,14 @@ const translations = {
     loginToSave: 'Save stop',
     upcomingDepartures: 'Upcoming Departures',
     lineRoute: 'Line Route',
+    stopLocation: 'Stop location',
     noLineSelected: 'No line selected',
     showRoute: 'Show route',
     line: 'Line',
     noDepartures60: 'No departures are scheduled in the next 60 minutes.',
     selectLines: 'Tap a line if you want to narrow the list.',
+    chooseLinesPrompt: 'Choose one or more lines to show departures.',
+    clearSelection: 'Clear',
     noSelectedDepartures: 'No departures for the selected lines in the next 60 minutes.',
     directionUnavailable: 'Direction unavailable',
     noFavoritesPublic: 'Saved stops will appear here.',
@@ -1102,6 +1116,15 @@ function createFavoriteStopIcon(lines) {
   });
 }
 
+function createRouteLabelIcon(label, color) {
+  return L.divIcon({
+    className: 'route-line-map-label',
+    html: `<span style="--route-label-color:${escapeHtml(color)}">${escapeHtml(label)}</span>`,
+    iconSize: [72, 26],
+    iconAnchor: [36, 13]
+  });
+}
+
 function ensureMap() {
   if (!mapContainer || typeof L === 'undefined' || map) {
     return;
@@ -1216,6 +1239,30 @@ function renderStopsOnMap(stops, fitBounds = true) {
   } else if (validStops.length === 1) {
     map.setView([validStops[0].lat, validStops[0].lon], 16);
   }
+}
+
+function centerCurrentStopMap(retries = 2) {
+  if (!map || state.currentView !== 'stop' || state.routeDirections.length || !hasCoordinates(state.currentStop)) {
+    return;
+  }
+
+  const target = [Number(state.currentStop.lat), Number(state.currentStop.lon)];
+  if (!Number.isFinite(target[0]) || !Number.isFinite(target[1])) {
+    return;
+  }
+
+  requestAnimationFrame(() => {
+    map.invalidateSize({ pan: false });
+    suppressMapFocusUntil = Date.now() + 900;
+    map.flyTo(target, 17, {
+      animate: false,
+      duration: 0
+    });
+
+    if (retries > 0) {
+      window.setTimeout(() => centerCurrentStopMap(retries - 1), 120);
+    }
+  });
 }
 
 function shouldUseMapFocusStops() {
@@ -1389,6 +1436,67 @@ function renderRouteOnMap(directions) {
         .addTo(state.markerLayer)
         .bindPopup(`<strong>${escapeHtml(direction.headsign)}</strong>`);
     }
+  });
+
+  renderFavoriteStopsOnMap();
+
+  if (allPoints.length > 0) {
+    map.fitBounds(L.latLngBounds(allPoints).pad(0.12));
+  }
+}
+
+function getRouteLabelPoint(points) {
+  if (!points.length) {
+    return null;
+  }
+
+  return points[Math.floor(points.length / 2)];
+}
+
+function renderLineRouteSetsOnMap(routeSets) {
+  if (!map) {
+    return;
+  }
+
+  suppressMapFocusUntil = Date.now() + 900;
+  clearMapLayers();
+  const colors = ['#b84f32', '#287460', '#315f53', '#7c5c2e', '#9d382c', '#185fa5'];
+  const allPoints = [];
+
+  routeSets.forEach((routeSet, routeSetIndex) => {
+    const color = colors[routeSetIndex % colors.length];
+    let labelPlaced = false;
+
+    routeSet.directions.forEach((direction) => {
+      const points = (direction.stops || [])
+        .map((stop) => [Number(stop.stop_lat), Number(stop.stop_lon)])
+        .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+      if (points.length < 2) {
+        return;
+      }
+
+      allPoints.push(...points);
+      L.polyline(points, {
+        color,
+        weight: 4,
+        opacity: 0.82
+      })
+        .addTo(state.routeLayer)
+        .bindPopup(`<strong>${escapeHtml(t('line'))} ${escapeHtml(routeSet.line)}</strong>`);
+
+      if (!labelPlaced) {
+        const labelPoint = getRouteLabelPoint(points);
+        if (labelPoint) {
+          L.marker(labelPoint, {
+            icon: createRouteLabelIcon(routeSet.line, color),
+            interactive: false,
+            zIndexOffset: 1300
+          }).addTo(state.routeLayer);
+          labelPlaced = true;
+        }
+      }
+    });
   });
 
   renderFavoriteStopsOnMap();
@@ -2044,9 +2152,9 @@ function updateMapForCurrentView() {
     }
 
     if (state.currentStop && hasCoordinates(state.currentStop)) {
-      renderStopsOnMap([state.currentStop], true);
+      renderStopsOnMap([state.currentStop], false);
       suppressMapFocusUntil = Date.now() + 900;
-      map.setView([state.currentStop.lat, state.currentStop.lon], 16);
+      centerCurrentStopMap();
       return;
     }
   }
@@ -2059,7 +2167,7 @@ function syncShell() {
   const standaloneAuth = state.currentView === 'auth';
   const showMap = state.currentView === 'search'
     || state.currentView === 'navigate'
-    || (state.currentView === 'stop' && state.routeDirections.length)
+    || (state.currentView === 'stop' && (state.routeDirections.length || hasCoordinates(state.currentStop)))
     || state.mapExpanded;
   const expandedMapAnchor = document.getElementById('map-expanded-anchor');
   const mapAnchor = state.mapExpanded && expandedMapAnchor
@@ -2334,9 +2442,9 @@ function renderFavoritesList() {
       }
 
       return `
-        <div class="bus-item">
+          <div class="bus-item">
           <button class="bus-item-main" data-action="open-stop" ${stopDataset(favorite)}>
-            <span class="favorite-icon" aria-hidden="true"><i data-lucide="map-pin"></i></span>
+            <span class="favorite-icon" aria-hidden="true"><i data-lucide="star"></i></span>
             <div class="bus-info">
               <strong>${escapeHtml(favoriteName)}</strong>
               <span>${escapeHtml(t('stop'))} ${escapeHtml(favorite.stationId)}</span>
@@ -2377,9 +2485,10 @@ function renderArrivals() {
   }
 
   const availableLines = getAvailableArrivalLines();
-  const filteredArrivals = state.selectedDepartureLines.length
+  const hasLineSelection = state.selectedDepartureLines.length > 0;
+  const filteredArrivals = hasLineSelection
     ? upcomingArrivals.filter((arrival) => hasSelectedDepartureLine(arrival.line || t('unknown')))
-    : upcomingArrivals;
+    : [];
   const groups = new Map();
   filteredArrivals.forEach((arrival) => {
     const line = arrival.line || t('unknown');
@@ -2393,13 +2502,23 @@ function renderArrivals() {
     <div class="stack-gap">
       <div class="departure-filter-row" aria-label="${escapeHtml(t('chooseLines'))}">
         <button
-          class="line-filter-chip line-filter-chip--all ${state.selectedDepartureLines.length ? '' : 'active'}"
+          class="line-filter-chip line-filter-chip--all ${state.selectedDepartureLines.length === availableLines.length && availableLines.length ? 'active' : ''}"
           type="button"
-          data-action="clear-departure-lines"
-          aria-pressed="${state.selectedDepartureLines.length ? 'false' : 'true'}"
+          data-action="select-all-departure-lines"
+          aria-pressed="${state.selectedDepartureLines.length === availableLines.length && availableLines.length ? 'true' : 'false'}"
         >
           ${escapeHtml(t('allLines'))}
         </button>
+        ${state.selectedDepartureLines.length ? `
+          <button
+            class="line-filter-chip line-filter-chip--clear"
+            type="button"
+            data-action="clear-departure-lines"
+            aria-pressed="false"
+          >
+            ${escapeHtml(t('clearSelection'))}
+          </button>
+        ` : ''}
         ${availableLines.map((line) => `
           <button
             class="line-filter-chip ${hasSelectedDepartureLine(line) ? 'active' : ''}"
@@ -2413,7 +2532,9 @@ function renderArrivals() {
         `).join('')}
       </div>
       ${
-        filteredArrivals.length
+        !hasLineSelection
+          ? renderListMessage(t('chooseLinesPrompt'))
+          : filteredArrivals.length
           ? Array.from(groups.entries())
               .sort(([leftLine], [rightLine]) => compareLineLabels(leftLine, rightLine))
               .map(([line, arrivals]) => `
@@ -2591,8 +2712,8 @@ function renderRecentLinesCarousel() {
           .map((item, index) => `
             <button class="recent-bus-card" data-action="open-recent-item" data-recent-index="${index}">
               <span class="recent-bus-card__icon"><i data-lucide="bus-front"></i></span>
-              <span class="recent-bus-card__line">${escapeHtml(item.type === 'stop' ? item.presetLine : item.line)}</span>
-              ${item.type === 'stop' ? `<span class="recent-bus-card__station">${escapeHtml(item.stationId)}</span>` : ''}
+              <span class="recent-bus-card__line">${escapeHtml(item.type === 'stop' ? `${item.presetLine} · ${item.stationId}` : item.line)}</span>
+              <span class="recent-bus-card__station">${escapeHtml(item.type === 'stop' ? (item.name || t('stop')) : t('lineRoute'))}</span>
             </button>
           `)
           .join('')}
@@ -2637,8 +2758,8 @@ function renderHomeRecentRows() {
       ${state.recentLines.slice(0, 3).map((item, index) => `
         <button class="home-row" data-action="open-recent-item" data-recent-index="${index}">
           <span class="home-row__icon"><i data-lucide="bus-front"></i></span>
-          <span class="home-row__main">${escapeHtml(item.type === 'stop' ? `${item.name || t('stop')} (${item.stationId})` : item.line)}</span>
-          <span class="home-row__meta">${escapeHtml(item.type === 'stop' ? item.presetLine : t('line'))}</span>
+          <span class="home-row__main">${escapeHtml(item.type === 'stop' ? `${item.presetLine} · ${item.name || t('stop')} (${item.stationId})` : item.line)}</span>
+          <span class="home-row__meta">${escapeHtml(item.type === 'stop' ? t('upcomingDepartures') : t('lineRoute'))}</span>
           <i data-lucide="arrow-right"></i>
         </button>
       `).join('')}
@@ -3205,6 +3326,32 @@ function renderStopView() {
   const favoriteAction = favorite
     ? `<button class="ghost-action" data-action="delete-favorite" data-favorite-name="${escapeHtml(favorite.favoriteName)}">${escapeHtml(t('removeFavorite'))}</button>`
     : `<button class="favorite-save-btn stop-save-btn" type="button" data-action="save-current-stop"><i data-lucide="star"></i><span>${escapeHtml(t('saveFavorite'))}</span></button>`;
+  const hasStopMap = state.routeDirections.length || hasCoordinates(state.currentStop);
+  const mapTitle = state.routeDirections.length ? t('lineRoute') : t('stopLocation');
+  const mapLabel = state.routeDirections.length
+    ? (state.routeLine || t('line'))
+    : `${t('stop')} ${state.currentStop.stationId}`;
+  const mapSection = `
+    <section class="panel-block">
+      <div class="panel-block__header">
+        <div class="section-label">${escapeHtml(mapTitle)}</div>
+        <span class="panel-copy">${escapeHtml(state.routeLine || `${t('stop')} ${state.currentStop.stationId}` || t('noLineSelected'))}</span>
+      </div>
+      ${hasStopMap ? `
+        <section class="map-stage route-map-stage" aria-label="${escapeHtml(mapTitle)}">
+          <div class="map-stage__label">
+            <span>${escapeHtml(mapTitle)}</span>
+            <strong>${escapeHtml(mapLabel)}</strong>
+          </div>
+          <button class="map-expand-btn" type="button" data-action="expand-map" aria-label="${escapeHtml(t('showOnMap'))}">
+            <i data-lucide="maximize-2"></i>
+          </button>
+          <div id="map-anchor" class="inline-map-anchor"></div>
+        </section>
+      ` : ''}
+      ${state.routeDirections.length ? renderRouteDirections() : ''}
+    </section>
+  `;
 
   return `
     <section class="stop-shell">
@@ -3215,6 +3362,8 @@ function renderStopView() {
         <div class="stop-hero__eyebrow">${escapeHtml(t('stop'))} ${escapeHtml(state.currentStop.stationId)}</div>
         <h1>${escapeHtml(state.currentStop.name)}</h1>
       </div>
+
+      ${mapSection}
 
       <section class="panel-block">
         <div class="panel-block__header">
@@ -3228,26 +3377,6 @@ function renderStopView() {
 
       <section class="stop-secondary-actions">
         ${favoriteAction}
-      </section>
-
-      <section class="panel-block">
-        <div class="panel-block__header">
-          <div class="section-label">${escapeHtml(t('lineRoute'))}</div>
-          <span class="panel-copy">${escapeHtml(state.routeLine || t('noLineSelected'))}</span>
-        </div>
-        ${state.routeDirections.length ? `
-          <section class="map-stage route-map-stage" aria-label="${escapeHtml(t('lineRoute'))}">
-            <div class="map-stage__label">
-              <span>${escapeHtml(t('lineRoute'))}</span>
-              <strong>${escapeHtml(state.routeLine || t('line'))}</strong>
-            </div>
-            <button class="map-expand-btn" type="button" data-action="expand-map" aria-label="${escapeHtml(t('showOnMap'))}">
-              <i data-lucide="maximize-2"></i>
-            </button>
-            <div id="map-anchor" class="inline-map-anchor"></div>
-          </section>
-        ` : ''}
-        ${renderRouteDirections()}
       </section>
     </section>
   `;
@@ -3279,6 +3408,7 @@ function afterRenderBindings() {
   updateNavLabels();
   setActiveNav();
   updateMapForCurrentView();
+  centerCurrentStopMap();
   focusActiveOverlay();
 }
 
@@ -4893,7 +5023,8 @@ async function loadStopArrivals() {
   renderView('stop');
 }
 
-async function openStop(stop) {
+async function openStop(stop, options = {}) {
+  const { autoShowFavoriteRoutes = false } = options;
   state.currentStop = normalizeStop(stop);
   recordFavoriteUse(state.currentStop);
   state.activeSheet = '';
@@ -4901,14 +5032,55 @@ async function openStop(stop) {
   state.routeDirections = [];
   state.routeLine = '';
   state.routeMessage = t('routeInitial');
-  if (state.currentStop.presetLine) {
-    parseLineList(state.currentStop.presetLine).forEach(addRecentLine);
-  }
   renderView('stop');
 
   state.currentStop = await getStopDetails(state.currentStop);
   state.currentStop = await enrichStopCoordinates(state.currentStop);
   await loadStopArrivals();
+  if (autoShowFavoriteRoutes && state.selectedDepartureLines.length) {
+    await renderFavoriteRoutesForCurrentStop();
+  }
+}
+
+async function renderFavoriteRoutesForCurrentStop() {
+  if (!state.currentStop || !state.selectedDepartureLines.length) {
+    return;
+  }
+
+  const routeSets = [];
+  const allDirections = [];
+
+  await Promise.all(state.selectedDepartureLines.map(async (line) => {
+    try {
+      const routeParams = new URLSearchParams({ line });
+      if (state.currentStop?.stationId) {
+        routeParams.set('station_id', state.currentStop.stationId);
+      }
+      const data = await apiRequest(`/route?${routeParams.toString()}`);
+      const directions = data.directions || [];
+      if (directions.length) {
+        routeSets.push({ line, directions });
+        allDirections.push(...directions);
+      }
+    } catch (error) {
+      // Ignore individual route failures so one missing line does not block the saved stop.
+    }
+  }));
+
+  if (!routeSets.length) {
+    state.routeDirections = [];
+    state.routeLine = state.selectedDepartureLines.join(', ');
+    state.routeMessage = t('noRoute');
+    renderView('stop');
+    return;
+  }
+
+  routeSets.sort((left, right) => compareLineLabels(left.line, right.line));
+  state.routeDirections = allDirections;
+  state.routeLine = routeSets.map((routeSet) => routeSet.line).join(', ');
+  state.routeMessage = `${t('showingRoute')} ${state.routeLine}.`;
+  renderView('stop');
+  renderLineRouteSetsOnMap(routeSets);
 }
 
 async function loadLineRoute(line, options = {}) {
@@ -5422,13 +5594,17 @@ function wireNavigation() {
 
     if (action === 'open-stop') {
       state.favoriteChoiceStop = null;
-      await openStop(getStopFromElement(actionTarget));
+      await openStop(getStopFromElement(actionTarget), {
+        autoShowFavoriteRoutes: state.currentView === 'favorites'
+      });
       return;
     }
 
     if (action === 'open-favorite-preset') {
       state.favoriteChoiceStop = null;
-      await openStop(getStopFromElement(actionTarget));
+      await openStop(getStopFromElement(actionTarget), {
+        autoShowFavoriteRoutes: state.currentView === 'favorites'
+      });
       return;
     }
 
@@ -5444,7 +5620,9 @@ function wireNavigation() {
 
     if (action === 'open-favorite-choice-preset') {
       state.favoriteChoiceStop = null;
-      await openStop(getStopFromElement(actionTarget));
+      await openStop(getStopFromElement(actionTarget), {
+        autoShowFavoriteRoutes: state.currentView === 'favorites'
+      });
       return;
     }
 
@@ -5600,6 +5778,7 @@ function wireNavigation() {
         return;
       }
 
+      state.mapExpanded = true;
       await loadLineRoute(recentItem.line || '', { standalone: true });
       return;
     }

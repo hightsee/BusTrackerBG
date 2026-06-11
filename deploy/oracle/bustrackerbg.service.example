@@ -1,0 +1,18 @@
+[Unit]
+Description=BusTrackerBG Flask API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bustracker
+Group=bustracker
+WorkingDirectory=/opt/bustrackerbg/app
+EnvironmentFile=/etc/bustrackerbg.env
+ExecStart=/opt/bustrackerbg/app/.venv/bin/waitress-serve --host=127.0.0.1 --port=5000 --threads=12 wsgi:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

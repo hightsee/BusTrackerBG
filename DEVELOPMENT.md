@@ -97,7 +97,7 @@ For public deployments:
 
 The production VM uses:
 
-- `bustracker.service` running `waitress-serve --host=127.0.0.1 --port=5000 api:app`
+- `bustracker.service` running `waitress-serve --host=127.0.0.1 --port=5000 wsgi:app`
 - Nginx virtual host for `bustracker.gifted3.com`
 - Let's Encrypt certificate managed by Certbot
 - Built frontend copied to `/var/www/bustracker`

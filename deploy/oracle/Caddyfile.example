@@ -1,0 +1,15 @@
+YOUR_DOMAIN_HERE {
+    encode zstd gzip
+
+    root * /opt/bustrackerbg/app/frontend/dist
+
+    handle /api/* {
+        reverse_proxy 127.0.0.1:5000
+    }
+
+    handle {
+        try_files {path} /index.html
+        file_server
+    }
+}
+

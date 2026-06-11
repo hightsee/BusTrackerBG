@@ -63,7 +63,7 @@ if RATE_LIMIT_STORAGE_URI == "memory://":
 app.config['SECRET_KEY'] = JWT_SECRET
 START_TIME = time.time()
 scheduler = BackgroundScheduler(daemon=True)
-bgprevoz_update_lock = threading.Lock()
+transit_data_update_lock = threading.Lock()
 
 GEOCODING_VIEWBOX = "20.0908,45.0770,20.7277,44.3691"
 BELGRADE_LAT_MIN = 44.35
@@ -86,6 +86,8 @@ TRANSIT_DATA_CACHE_NAMESPACES = {
 }
 PASSWORD_RESET_TOKEN_TTL_MINUTES = 30
 ROUTING_CACHE_TTL_SECONDS = 180
+MAX_SEARCH_QUERY_LENGTH = 120
+MAX_ROUTING_BATCH_PAIRS = 40
 
 def hash_reset_token(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -154,34 +156,50 @@ def is_in_belgrade_bounds(lat, lon):
         and BELGRADE_LON_MIN <= lon <= BELGRADE_LON_MAX
     )
 
-def scheduled_gtfs_update(force=False):
-    logging.info("Running scheduled GTFS update from API service...")
-    updated = gtfs_manager.update_gtfs(force=force)
-    if updated:
-        clear_transit_data_cache("GTFS update")
-    return updated
-
-def scheduled_bgprevoz_update():
+def _run_bgprevoz_update_unlocked():
     if not BGPREVOZ_UPDATE_ENABLED:
         logging.info("BG Prevoz update skipped because BGPREVOZ_UPDATE_ENABLED=false.")
         return False
 
-    if not bgprevoz_update_lock.acquire(blocking=False):
-        logging.info("BG Prevoz update skipped because another import is already in progress.")
+    logging.info("Running scheduled BG Prevoz import from API service...")
+    summary = BgPrevozImporter(delay_seconds=BGPREVOZ_IMPORT_DELAY_SECONDS).apply()
+    logging.info("BG Prevoz import completed: %s", summary)
+    if int(summary.get("imported_lines") or 0) > 0:
+        clear_transit_data_cache("BG Prevoz import")
+    return True
+
+def scheduled_gtfs_update(force=False):
+    if not transit_data_update_lock.acquire(blocking=False):
+        logging.info("GTFS update skipped because another transit data update is already in progress.")
         return False
 
     try:
-        logging.info("Running scheduled BG Prevoz import from API service...")
-        summary = BgPrevozImporter(delay_seconds=BGPREVOZ_IMPORT_DELAY_SECONDS).apply()
-        logging.info("BG Prevoz import completed: %s", summary)
-        if int(summary.get("imported_lines") or 0) > 0:
-            clear_transit_data_cache("BG Prevoz import")
-        return True
+        logging.info("Running scheduled GTFS update from API service...")
+        updated = gtfs_manager.update_gtfs(force=force)
+        if updated:
+            if BGPREVOZ_UPDATE_ENABLED:
+                logging.info("Applying BG Prevoz import after GTFS refresh because it is the source of truth.")
+                _run_bgprevoz_update_unlocked()
+            clear_transit_data_cache("GTFS update")
+        return updated
+    except Exception:
+        logging.exception("Scheduled GTFS update failed.")
+        return False
+    finally:
+        transit_data_update_lock.release()
+
+def scheduled_bgprevoz_update():
+    if not transit_data_update_lock.acquire(blocking=False):
+        logging.info("BG Prevoz update skipped because another transit data update is already in progress.")
+        return False
+
+    try:
+        return _run_bgprevoz_update_unlocked()
     except Exception:
         logging.exception("Scheduled BG Prevoz import failed.")
         return False
     finally:
-        bgprevoz_update_lock.release()
+        transit_data_update_lock.release()
 
 def compute_next_gtfs_run() -> datetime.datetime:
     now = datetime.datetime.now()
@@ -216,10 +234,30 @@ def should_refresh_gtfs_on_start() -> bool:
     now = datetime.datetime.now(last_update_dt.tzinfo) if last_update_dt.tzinfo else datetime.datetime.now()
     return (now - last_update_dt) >= datetime.timedelta(days=GTFS_UPDATE_INTERVAL_DAYS)
 
+def should_refresh_bgprevoz_on_start() -> bool:
+    if not BGPREVOZ_UPDATE_ENABLED:
+        return False
+
+    last_update = gtfs_manager.get_metadata("bgprevoz_last_update")
+    if not last_update:
+        return True
+
+    try:
+        last_update_dt = datetime.datetime.fromisoformat(last_update)
+    except ValueError:
+        return True
+
+    now = datetime.datetime.now(last_update_dt.tzinfo) if last_update_dt.tzinfo else datetime.datetime.now()
+    return (now - last_update_dt) >= datetime.timedelta(days=BGPREVOZ_UPDATE_INTERVAL_DAYS)
+
 def initialize_services():
-    if should_refresh_gtfs_on_start():
+    gtfs_refresh_on_start = should_refresh_gtfs_on_start()
+    if gtfs_refresh_on_start:
         logging.info("GTFS data missing or stale; starting background refresh...")
         threading.Thread(target=scheduled_gtfs_update, kwargs={"force": True}, daemon=True).start()
+    elif should_refresh_bgprevoz_on_start():
+        logging.info("BG Prevoz data missing or stale; starting background import...")
+        threading.Thread(target=scheduled_bgprevoz_update, daemon=True).start()
 
     if not scheduler.running:
         next_gtfs_run = compute_next_gtfs_run()
@@ -557,8 +595,8 @@ def find_walk_expanded_routes_between_stations(origin_station, dest_station, ori
 
     if len(expanded_routes) < 4:
         route_cache = {}
-        for origin_candidate in origin_candidates[:20]:
-            for destination_candidate in destination_candidates[:10]:
+        for origin_candidate in origin_candidates[:16]:
+            for destination_candidate in destination_candidates[:4]:
                 if origin_candidate["station_id"] == destination_candidate["station_id"]:
                     continue
                 route_key = (origin_candidate["stop_id"], destination_candidate["stop_id"])
@@ -768,6 +806,9 @@ def token_required(f):
             current_user = app_data_manager.get_api_user(data['username'])
             if not current_user:
                 return jsonify({'error': 'Invalid Token!'}), 401
+            password_changed_at = current_user.get('password_changed_at') or ''
+            if password_changed_at and data.get('pwd_changed_at') != password_changed_at:
+                return jsonify({'error': 'Invalid Token!'}), 401
         except jwt.ExpiredSignatureError:
             return jsonify({'error': 'Token has expired!'}), 401
         except jwt.InvalidTokenError:
@@ -836,6 +877,7 @@ def login():
         token = jwt.encode({
             'user_id': user['id'],
             'username': user['username'],
+            'pwd_changed_at': user.get('password_changed_at') or '',
             'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
         }, app.config['SECRET_KEY'], algorithm="HS256")
         
@@ -865,15 +907,16 @@ def request_password_reset():
     ).isoformat()
     app_data_manager.create_password_reset_token(user['id'], hash_reset_token(token), expires_at)
 
-    logging.warning(
-        "Password reset token for username '%s' expires in %s minutes: %s",
-        username,
-        PASSWORD_RESET_TOKEN_TTL_MINUTES,
-        token,
-    )
-
     if IS_LOCAL_DEV:
+        logging.warning(
+            "Password reset token for username '%s' expires in %s minutes: %s",
+            username,
+            PASSWORD_RESET_TOKEN_TTL_MINUTES,
+            token,
+        )
         response['reset_token'] = token
+    else:
+        logging.info("Password reset token generated for user id %s.", user['id'])
 
     return jsonify(response), 200
 
@@ -890,26 +933,27 @@ def confirm_password_reset():
     if password_error:
         return jsonify({'error': password_error}), 400
 
-    reset_record = app_data_manager.get_valid_password_reset_token(
+    hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    reset_record = app_data_manager.reset_password_with_token(
         hash_reset_token(token),
         datetime.datetime.now().isoformat(),
+        hashed.decode('utf-8'),
     )
     if not reset_record:
         return jsonify({'error': 'Reset token is invalid or expired'}), 400
 
-    hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-    app_data_manager.update_api_user_password(reset_record['user_id'], hashed.decode('utf-8'))
-    app_data_manager.mark_password_reset_token_used(reset_record['id'])
-
     return jsonify({'message': 'Password updated successfully'}), 200
 
 @app.route('/api/search', methods=['GET'])
+@limiter.limit("60 per minute")
 def search():
-    query = request.args.get('q')
+    query = (request.args.get('q') or '').strip()
     if not query:
         return jsonify({'error': 'Query parameter q is required'}), 400
+    if len(query) > MAX_SEARCH_QUERY_LENGTH:
+        return jsonify({'error': f'Query must be at most {MAX_SEARCH_QUERY_LENGTH} characters'}), 400
 
-    cache_key = normalize_text(query.strip())
+    cache_key = normalize_text(query)
     cached = cache_get("stop_search", cache_key, 300)
     if cached is not None:
         return jsonify(cached)
@@ -934,14 +978,11 @@ def search():
 @app.route('/api/search/address', methods=['GET'])
 @limiter.limit("20 per minute")
 def search_by_address():
-    query = request.args.get('q')
+    query = (request.args.get('q') or '').strip()
     if not query:
         return jsonify({'error': 'Query parameter q is required'}), 400
-    query = query.strip()
-    if not query:
-        return jsonify({'error': 'Query parameter q is required'}), 400
-    if len(query) > 160:
-        return jsonify({'error': 'Query parameter q is too long'}), 400
+    if len(query) > MAX_SEARCH_QUERY_LENGTH:
+        return jsonify({'error': f'Query must be at most {MAX_SEARCH_QUERY_LENGTH} characters'}), 400
 
     try:
         radius = min(max(float(request.args.get('radius', 650)), 100), ADDRESS_SEARCH_MAX_RADIUS_M)
@@ -1103,6 +1144,7 @@ def get_route():
     })
 
 @app.route('/api/routing', methods=['GET'])
+@limiter.limit("60 per minute")
 def find_routing():
     origin = request.args.get('from')
     dest = request.args.get('to')
@@ -1137,6 +1179,7 @@ def find_routing():
     return jsonify(payload)
 
 @app.route('/api/routing/batch', methods=['POST'])
+@limiter.limit("20 per minute")
 def find_routing_batch():
     data = request.get_json(silent=True) or {}
     pairs = data.get('pairs') or []
@@ -1144,7 +1187,7 @@ def find_routing_batch():
         return jsonify({'error': 'pairs must be a list'}), 400
 
     strict_stops = bool(data.get('strict_stops'))
-    pairs = pairs[:60]
+    pairs = pairs[:MAX_ROUTING_BATCH_PAIRS]
     resolved_cache = {}
     route_cache = {}
     results = []
@@ -1209,6 +1252,7 @@ def find_routing_batch():
     return jsonify({'results': results})
 
 @app.route('/api/journey', methods=['POST'])
+@limiter.limit("20 per minute")
 def find_journey():
     data = request.get_json(silent=True) or {}
     origin = data.get('origin') or {}
@@ -1221,6 +1265,11 @@ def find_journey():
         destination_radius = min(max(float(data.get('destination_radius', 350)), 100), 1000)
     except (TypeError, ValueError):
         return jsonify({'error': 'origin.lat, origin.lon, origin_radius, and destination_radius must be valid numbers'}), 400
+
+    if not all(math.isfinite(value) for value in (origin_lat, origin_lon, origin_radius, destination_radius)):
+        return jsonify({'error': 'origin.lat, origin.lon, origin_radius, and destination_radius must be finite numbers'}), 400
+    if not is_in_belgrade_bounds(origin_lat, origin_lon):
+        return jsonify({'error': 'origin coordinates are outside the supported Belgrade area'}), 400
 
     destination_station_id = str(destination.get('station_id') or '').strip()
     if not destination_station_id:
@@ -1253,6 +1302,11 @@ def find_journey():
     except (TypeError, ValueError):
         destination_lat = float(destination_stop["stop_lat"])
         destination_lon = float(destination_stop["stop_lon"])
+
+    if not math.isfinite(destination_lat) or not math.isfinite(destination_lon):
+        return jsonify({'error': 'destination coordinates must be finite numbers'}), 400
+    if not is_in_belgrade_bounds(destination_lat, destination_lon):
+        return jsonify({'error': 'destination coordinates are outside the supported Belgrade area'}), 400
 
     destination_candidates = []
     seen_destination_ids = set()
@@ -1337,8 +1391,8 @@ def find_journey():
     if len(journeys) < 4:
         route_cache = {}
         transfer_origins = origin_candidates[:20]
-        transfer_destinations = destination_candidates[:10]
-        for origin_stop in transfer_origins:
+        transfer_destinations = destination_candidates[:4]
+        for origin_stop in transfer_origins[:16]:
             for destination_candidate in transfer_destinations:
                 if origin_stop["station_id"] == destination_candidate["station_id"]:
                     continue

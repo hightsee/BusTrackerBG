@@ -37,9 +37,14 @@ class AppDataManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE,
                 password_hash TEXT,
-                created_at TEXT
+                created_at TEXT,
+                password_changed_at TEXT
             )
         """)
+        cursor.execute("PRAGMA table_info(api_users)")
+        user_columns = {row[1] for row in cursor.fetchall()}
+        if "password_changed_at" not in user_columns:
+            cursor.execute("ALTER TABLE api_users ADD COLUMN password_changed_at TEXT")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -63,8 +68,10 @@ class AppDataManager:
         cursor = conn.cursor()
         success = False
         try:
-            cursor.execute("INSERT INTO api_users (username, password_hash, created_at) VALUES (?, ?, ?)",
-                           (username, password_hash, current_time))
+            cursor.execute(
+                "INSERT INTO api_users (username, password_hash, created_at, password_changed_at) VALUES (?, ?, ?, ?)",
+                (username, password_hash, current_time, current_time),
+            )
             conn.commit()
             success = True
         except sqlite3.IntegrityError:
@@ -78,7 +85,7 @@ class AppDataManager:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT id, username, password_hash FROM api_users WHERE username = ?", (username,))
+        cursor.execute("SELECT id, username, password_hash, password_changed_at FROM api_users WHERE username = ?", (username,))
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
@@ -87,7 +94,11 @@ class AppDataManager:
         """Updates a user's password hash."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("UPDATE api_users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+        current_time = datetime.now().isoformat()
+        cursor.execute(
+            "UPDATE api_users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
+            (password_hash, current_time, user_id),
+        )
         conn.commit()
         updated = cursor.rowcount > 0
         conn.close()
@@ -139,6 +150,46 @@ class AppDataManager:
         )
         conn.commit()
         conn.close()
+
+    def reset_password_with_token(self, token_hash: str, now: str, password_hash: str) -> Optional[Dict[str, Any]]:
+        """Atomically consumes a reset token and updates the matching user's password."""
+        current_time = datetime.now().isoformat()
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT password_reset_tokens.id, password_reset_tokens.user_id, api_users.username
+                FROM password_reset_tokens
+                JOIN api_users ON api_users.id = password_reset_tokens.user_id
+                WHERE password_reset_tokens.token_hash = ?
+                  AND password_reset_tokens.used_at IS NULL
+                  AND password_reset_tokens.expires_at > ?
+                """,
+                (token_hash, now),
+            )
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+
+            cursor.execute(
+                "UPDATE api_users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
+                (password_hash, current_time, row["user_id"]),
+            )
+            cursor.execute(
+                "UPDATE password_reset_tokens SET used_at = ? WHERE id = ?",
+                (current_time, row["id"]),
+            )
+            conn.commit()
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def save_favorite(self, user_id: str, fav_name: str, station_uid: str, station_sid: str, line: Optional[str] = None) -> str:
         """Saves a favorite station for a user and returns the stored favorite name."""

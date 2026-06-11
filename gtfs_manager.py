@@ -12,7 +12,7 @@ import threading
 import hashlib
 import urllib.parse
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, cast
 from config import (
     GTFS_DB,
@@ -538,6 +538,13 @@ class GTFSManager:
         parts = time_str.split(':')
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
 
+    def _format_gtfs_time(self, seconds: int) -> str:
+        """Converts seconds from service-day midnight to HH:MM:SS. Supports HH >= 24."""
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
     def predict_bus_position(self, line_number: str, current_time_obj: Optional[datetime] = None) -> List[Dict[str, Any]]:
         if current_time_obj is None:
             current_time_obj = get_belgrade_time()
@@ -649,11 +656,20 @@ class GTFSManager:
         if current_time_obj is None:
             current_time_obj = get_belgrade_time()
             
-        service_ids = self._get_active_service_ids(current_time_obj)
-        if not service_ids:
-            return []
-            
         now_seconds = current_time_obj.hour * 3600 + current_time_obj.minute * 60 + current_time_obj.second
+        service_windows = []
+        current_service_ids = self._get_active_service_ids(current_time_obj)
+        if current_service_ids:
+            service_windows.append((current_service_ids, now_seconds))
+
+        if now_seconds < 4 * 3600:
+            previous_day = current_time_obj - timedelta(days=1)
+            previous_service_ids = self._get_active_service_ids(previous_day)
+            if previous_service_ids:
+                service_windows.append((previous_service_ids, now_seconds + 24 * 3600))
+
+        if not service_windows:
+            return []
         
         conn = self._connect()
         conn.row_factory = sqlite3.Row
@@ -711,30 +727,30 @@ class GTFSManager:
         display_stop_name = " / ".join(sorted(list(matched_stop_names)))
         
         placeholders_stops = ', '.join(['?'] * len(matched_stop_ids))
-        placeholders_services = ', '.join(['?'] * len(service_ids))
-        
         line_filter = ""
-        params = list(matched_stop_ids) + service_ids
         if line_numbers:
             lp = ', '.join(['?'] * len(line_numbers))
             line_filter = f"AND r.route_short_name IN ({lp})"
-            params.extend(line_numbers)
             
-        now_time = f"{current_time_obj.hour:02d}:{current_time_obj.minute:02d}:{current_time_obj.second:02d}"
         row_limit = max(100, min(600, (len(line_numbers) if line_numbers else 10) * 60))
-
-        query = f"""
-            SELECT r.route_short_name, st.arrival_time, t.trip_headsign, st.trip_id
-            FROM stop_times st
-            JOIN trips t ON st.trip_id = t.trip_id
-            JOIN routes r ON t.route_id = r.route_id
-            WHERE st.stop_id IN ({placeholders_stops}) AND t.service_id IN ({placeholders_services}) {line_filter}
-              AND st.arrival_time >= ?
-            ORDER BY st.arrival_time
-            LIMIT ?
-        """
-        cursor.execute(query, params + [now_time, row_limit])
-        rows = cursor.fetchall()
+        rows = []
+        for window_service_ids, comparison_now_seconds in service_windows:
+            placeholders_services = ', '.join(['?'] * len(window_service_ids))
+            params = list(matched_stop_ids) + window_service_ids
+            if line_numbers:
+                params.extend(line_numbers)
+            query = f"""
+                SELECT r.route_short_name, st.arrival_time, t.trip_headsign, st.trip_id
+                FROM stop_times st
+                JOIN trips t ON st.trip_id = t.trip_id
+                JOIN routes r ON t.route_id = r.route_id
+                WHERE st.stop_id IN ({placeholders_stops}) AND t.service_id IN ({placeholders_services}) {line_filter}
+                  AND st.arrival_time >= ?
+                ORDER BY st.arrival_time
+                LIMIT ?
+            """
+            cursor.execute(query, params + [self._format_gtfs_time(comparison_now_seconds), row_limit])
+            rows.extend((row, comparison_now_seconds) for row in cursor.fetchall())
         
         # Spatial fallback if the GTFS stop is dead (0 scheduled trips) but has coordinates
         if not rows and matched_stop_ids:
@@ -746,29 +762,36 @@ class GTFSManager:
                 nearby_ids = [str(nb['stop_id']) for nb in nearby if str(nb['stop_id']) not in matched_stop_ids]
                 if nearby_ids:
                     placeholders_stops = ', '.join(['?'] * len(nearby_ids))
-                    params = nearby_ids + service_ids
-                    if line_numbers:
-                        params.extend(line_numbers)
-                    query = f"""
-                        SELECT r.route_short_name, st.arrival_time, t.trip_headsign, st.trip_id
-                        FROM stop_times st
-                        JOIN trips t ON st.trip_id = t.trip_id
-                        JOIN routes r ON t.route_id = r.route_id
-                        WHERE st.stop_id IN ({placeholders_stops}) AND t.service_id IN ({placeholders_services}) {line_filter}
-                          AND st.arrival_time >= ?
-                        ORDER BY st.arrival_time
-                        LIMIT ?
-                    """
-                    cursor.execute(query, params + [now_time, row_limit])
-                    rows = cursor.fetchall()
+                    for window_service_ids, comparison_now_seconds in service_windows:
+                        placeholders_services = ', '.join(['?'] * len(window_service_ids))
+                        params = nearby_ids + window_service_ids
+                        if line_numbers:
+                            params.extend(line_numbers)
+                        query = f"""
+                            SELECT r.route_short_name, st.arrival_time, t.trip_headsign, st.trip_id
+                            FROM stop_times st
+                            JOIN trips t ON st.trip_id = t.trip_id
+                            JOIN routes r ON t.route_id = r.route_id
+                            WHERE st.stop_id IN ({placeholders_stops}) AND t.service_id IN ({placeholders_services}) {line_filter}
+                              AND st.arrival_time >= ?
+                            ORDER BY st.arrival_time
+                            LIMIT ?
+                        """
+                        cursor.execute(query, params + [self._format_gtfs_time(comparison_now_seconds), row_limit])
+                        rows.extend((row, comparison_now_seconds) for row in cursor.fetchall())
                     if rows:
                         display_stop_name += " (obližnje/nearby)"
         
         arrivals = []
         line_counts: Dict[str, int] = {}
-        for row in rows:
+        seen_arrivals = set()
+        for row, comparison_now_seconds in sorted(rows, key=lambda item: self._parse_gtfs_time(item[0]['arrival_time']) - item[1]):
+            arrival_key = (row['trip_id'], row['arrival_time'])
+            if arrival_key in seen_arrivals:
+                continue
+            seen_arrivals.add(arrival_key)
             arr_seconds = self._parse_gtfs_time(row['arrival_time'])
-            if arr_seconds < now_seconds:
+            if arr_seconds < comparison_now_seconds:
                 continue
                 
             line = row['route_short_name']
@@ -783,7 +806,7 @@ class GTFSManager:
             arrivals.append({
                 'line': line,
                 'arrival_time': row['arrival_time'],
-                'mins_remaining': (arr_seconds - now_seconds) // 60,
+                'mins_remaining': (arr_seconds - comparison_now_seconds) // 60,
                 'direction': row['trip_headsign'],
                 'stop_name': display_stop_name,
                 'buslogic_name': buslogic_name
@@ -794,7 +817,7 @@ class GTFSManager:
         if not arrivals:
             return [{'empty': True, 'stop_name': display_stop_name, 'buslogic_name': buslogic_name}]
             
-        arrivals.sort(key=lambda x: x['arrival_time'])
+        arrivals.sort(key=lambda x: x['mins_remaining'])
         return arrivals
 
     def get_line_route(self, line_number: str, stop_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1739,16 +1762,7 @@ class GTFSManager:
         
         route_id, route_long_name = route
 
-        # Strictly today's service IDs
-        day_eng = now.strftime('%A').lower()
-        # Security: Whitelist day_eng
-        valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-        if day_eng not in valid_days:
-            return f"Nije moguće utvrditi dan u nedelji: {day_eng}"
-
-        query = f"SELECT service_id FROM calendar WHERE {day_eng} = 1 AND start_date <= ? AND end_date >= ?"
-        cursor.execute(query, (today_str, today_str))
-        service_ids = [r[0] for r in cursor.fetchall()]
+        service_ids = self._get_active_service_ids(now)
 
         if not service_ids:
             conn.close()

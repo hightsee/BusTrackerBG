@@ -1195,6 +1195,12 @@ body.map-expanded-page {
     height: 20px;
 }
 
+.saved-stop-card [data-lucide="star"],
+.stop-save-btn [data-lucide="star"],
+.favorite-icon [data-lucide="star"] {
+    fill: currentColor;
+}
+
 .empty-state__skeleton {
     display: grid;
     gap: 0.45rem;
@@ -1923,8 +1929,8 @@ body.map-expanded-page {
 }
 
 .recent-bus-card__line {
-    font-size: 1rem;
-    font-weight: 700;
+    font-size: 0.94rem;
+    font-weight: 850;
 }
 
 .recent-bus-card__station {
@@ -2300,6 +2306,29 @@ body.map-expanded-page {
     text-overflow: ellipsis;
     transform: translateX(-50%);
     white-space: nowrap;
+}
+
+.route-line-map-label {
+    border: 0 !important;
+    background: transparent !important;
+}
+
+.route-line-map-label span {
+    display: inline-flex;
+    min-width: 34px;
+    height: 24px;
+    align-items: center;
+    justify-content: center;
+    border: 2px solid #fff8ec;
+    border-radius: 999px;
+    background: var(--route-label-color, var(--primary-color));
+    box-shadow: 0 8px 18px rgb(23 20 16 / 0.26);
+    color: #fff8ec;
+    font-family: 'Space Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    font-weight: 800;
+    line-height: 1;
+    padding: 0 0.5rem;
 }
 
 .grid-wrap,
